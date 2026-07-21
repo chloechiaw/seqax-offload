@@ -1,6 +1,6 @@
-zarr
+zarr<3          # zarr 3.x changed the Group array-creation / errors / attrs API used by training_io.py
 fsspec[gcs]
-jax[cpu]==0.4.26
+jax[cpu]==0.4.35  # 0.4.26 is unavailable on Python 3.11+; 0.4.35 supports memory-kind host offload (pinned_host)
 einops
 hydra-core
 clearml
