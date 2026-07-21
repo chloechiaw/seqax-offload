@@ -495,6 +495,36 @@ def main_contained(config, logger):
                     f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
                 )
 
+                # Phase 0 instrumentation (optimizer-state host-offload baseline).
+                # Report the memory footprint of each State component and peak device HBM.
+                # Motivation: Adam's mu/nu are each ~1x the weights, so optimizer state is
+                # ~2x the model and is the primary target for host offload.
+                def _tree_bytes(tree):
+                    return jax.tree.reduce(operator.add, jax.tree.map(lambda a: a.size * a.dtype.itemsize, tree))
+
+                gib = 2**30
+                weight_bytes = _tree_bytes(state.weights)
+                mu_bytes = _tree_bytes(state.adam_mu)
+                nu_bytes = _tree_bytes(state.adam_nu)
+                print(
+                    f"State footprint (global): weights={weight_bytes / gib:.3f} GiB, "
+                    f"adam_mu={mu_bytes / gib:.3f} GiB, adam_nu={nu_bytes / gib:.3f} GiB "
+                    f"(optimizer state = {(mu_bytes + nu_bytes) / max(weight_bytes, 1):.2f}x weights)"
+                )
+                try:
+                    mem = jax.local_devices()[0].memory_stats()
+                except Exception:
+                    mem = None
+                if mem and "peak_bytes_in_use" in mem:
+                    peak_gib = mem["peak_bytes_in_use"] / gib
+                    limit_gib = mem.get("bytes_limit", 0) / gib
+                    print(
+                        f"Peak HBM per device: {peak_gib:.3f} GiB"
+                        + (f" / {limit_gib:.3f} GiB limit" if limit_gib else "")
+                    )
+                else:
+                    print("Peak HBM per device: unavailable (backend has no memory_stats; expected on CPU)")
+
             training_io.log(step, logger, output)
 
 
