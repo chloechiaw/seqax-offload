@@ -6,7 +6,11 @@ def set_variables():
     _gpu_flags = ""
     if os.environ.get("SEQAX_CPU") != "1":
         _gpu_flags = "--xla_gpu_enable_async_collectives=true --xla_gpu_enable_latency_hiding_scheduler=true "
-    os.environ["XLA_FLAGS"] = os.environ.get("XLA_FLAGS", "") + " " + _gpu_flags
+    # Only set XLA_FLAGS if there's real content — a whitespace-only value makes
+    # XLA treat it as a filename and abort (happens with SEQAX_CPU=1 and no prior flags).
+    _flags = (os.environ.get("XLA_FLAGS", "") + " " + _gpu_flags).strip()
+    if _flags:
+        os.environ["XLA_FLAGS"] = _flags
     os.environ.update(
         {
             "NCCL_LL128_BUFFSIZE": "-2",
