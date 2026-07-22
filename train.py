@@ -16,7 +16,7 @@ import einops
 import hydra
 import jax
 import jax.numpy as jnp
-from clearml import Task
+# from clearml import Task  # lazy-imported below; only needed with a queue
 from jax import lax
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
@@ -462,7 +462,7 @@ def main_contained(config, logger):
             state, jnp.uint32(0), config.model, config.training, loader.load(0)
         ).compile()
         date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-        training_io.save_hlo_svg(os.path.join(model_dir, f"training_step_optimized_hlo_{date}.svg"), c_training_step)
+        pass  # training_io.save_hlo_svg(os.path.join(model_dir, f"training_step_optimized_hlo_{date}.svg"), c_training_step)
 
         for step in range(start_step, config.training.steps):
             if step % config.checkpoint_interval == 0 and step > start_step:
@@ -532,6 +532,7 @@ def main_contained(config, logger):
 def main(config):
     config = jax_extra.make_dataclass_from_dict(Config, config)
     if config.training.queue:
+        from clearml import Task
         task = Task.init(project_name="testing", task_name=config.paths.model_name)
         logger = task.get_logger()
         task.execute_remotely(queue_name=config.training.queue)

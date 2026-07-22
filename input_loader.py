@@ -33,9 +33,18 @@ import numpy as np
 # imports for hf dataloader
 import numpy as onp
 import zarr
-from datasets import load_dataset
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+try:
+    from datasets import load_dataset
+except Exception:
+    load_dataset = None
+try:
+    from torch.utils.data import DataLoader
+except Exception:
+    DataLoader = None
+try:
+    from transformers import AutoTokenizer
+except Exception:
+    AutoTokenizer = None
 from typeguard import typechecked
 
 import shardlib.shardtypes as shardtypes
