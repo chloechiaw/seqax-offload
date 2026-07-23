@@ -266,6 +266,14 @@ def get_flops_per_device():
     device = jax.devices()[0].device_kind
     if device.startswith("NVIDIA A100"):
         result = 312e12
+    elif device.startswith("TPU v4"):
+        result = 275e12
+    elif device.startswith("TPU v5 lite") or device.startswith("TPU v5e"):
+        result = 197e12
+    elif device.startswith("TPU v5"):
+        result = 459e12
+    elif device.startswith("TPU v3"):
+        result = 123e12
     else:
         print(f"Unrecognized device, assuming ridiculously low 1 MFLOPS. Device name: {device}")
         result = 1e6
