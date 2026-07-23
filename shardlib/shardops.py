@@ -193,11 +193,22 @@ def axis_size(name: str) -> int:
 # stream it back to HBM only for the weight update.
 
 
+try:
+    from jax._src.sharding_impls import TransferToMemoryKind as _TransferToMemoryKind
+except Exception:
+    _TransferToMemoryKind = None
+
+
 def _rememory(x, memory_kind: str):
-    """Return `x` placed in the given memory space, preserving its (chip) sharding spec."""
+    """Return `x` placed in the given memory space, preserving its (chip) sharding.
+
+    Works inside jit: there `x` is a tracer with no concrete `.sharding`, so we use
+    `TransferToMemoryKind`, which changes only the memory space and keeps the sharding.
+    """
+    if _TransferToMemoryKind is not None:
+        return jax.device_put(x, _TransferToMemoryKind(memory_kind))
+    # Fallback (older JAX, or a concrete array outside jit): rebuild the NamedSharding.
     s = x.sharding
-    if not isinstance(s, jax.sharding.NamedSharding):
-        raise ValueError(f"to_host/to_device expect a NamedSharding, got {type(s).__name__}")
     return jax.device_put(x, jax.sharding.NamedSharding(s.mesh, s.spec, memory_kind=memory_kind))
 
 
