@@ -525,6 +525,31 @@ def main_contained(config, logger):
                 else:
                     print("Peak HBM per device: unavailable (backend has no memory_stats; expected on CPU)")
 
+                # True per-device training memory, read from XLA's buffer assignment.
+                # `peak_bytes_in_use` above reports resident state (weights + optimizer) but omits the
+                # backward-pass activation/gradient scratch, so it under-reports the real training peak
+                # (e.g. 2b shows ~6 GiB yet a 4b model OOMs). `memory_analysis()` reads the compiler's
+                # actual buffer assignment, whose temp_size_in_bytes captures that scratch.
+                try:
+                    ma = c_training_step.memory_analysis()
+                except Exception:
+                    ma = None
+                if ma is not None:
+                    arg_gib = ma.argument_size_in_bytes / gib
+                    temp_gib = ma.temp_size_in_bytes / gib
+                    out_gib = ma.output_size_in_bytes / gib
+                    alias_gib = ma.alias_size_in_bytes / gib
+                    # Args and donated outputs share buffers (alias), so subtract the overlap.
+                    true_peak_gib = arg_gib + temp_gib + out_gib - alias_gib
+                    print(
+                        f"Compiled memory (per device): args(weights+opt+in)={arg_gib:.3f} GiB, "
+                        f"temp(activations+grad scratch)={temp_gib:.3f} GiB, "
+                        f"output={out_gib:.3f} GiB, alias={alias_gib:.3f} GiB"
+                    )
+                    print(f"True peak training memory per device: {true_peak_gib:.3f} GiB")
+                else:
+                    print("Compiled memory analysis: unavailable on this backend/JAX version")
+
             training_io.log(step, logger, output)
 
 
