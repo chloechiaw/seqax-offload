@@ -461,6 +461,20 @@ def main_contained(config, logger):
         c_training_step = training_step.lower(
             state, jnp.uint32(0), config.model, config.training, loader.load(0)
         ).compile()
+        # Print the compiled step's memory estimate right after compile, BEFORE any step runs,
+        # so it is captured even for configs that OOM at runtime. Lining args+temp up against the
+        # empirical OOM boundary reconciles the (over-counting) upper bound against ground truth.
+        try:
+            _ma = c_training_step.memory_analysis()
+            _gib = 2**30
+            _args = _ma.argument_size_in_bytes / _gib
+            _temp = _ma.temp_size_in_bytes / _gib
+            print(
+                f"[compile] per-device memory estimate: args={_args:.3f} GiB, temp={_temp:.3f} GiB, "
+                f"args+temp(upper bound)={_args + _temp:.3f} GiB (HBM limit ~30.75 GiB)"
+            )
+        except Exception as _e:
+            print(f"[compile] memory_analysis unavailable: {_e}")
         date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         pass  # training_io.save_hlo_svg(os.path.join(model_dir, f"training_step_optimized_hlo_{date}.svg"), c_training_step)
 
