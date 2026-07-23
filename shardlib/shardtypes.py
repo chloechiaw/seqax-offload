@@ -356,10 +356,21 @@ def make_partition_specs(cls):
     raise ValueError(f"Unsupported type {cls} is not a array, dataclass, or tuple type")
 
 
-def make_shardings(cls):
-    """Instantiates a pytree dataclass with NamedSharding at array type."""
+def make_shardings(cls, memory_kind=None):
+    """Instantiates a pytree dataclass with NamedSharding at array type.
+
+    If `memory_kind` is given (e.g. "pinned_host"), the arrays are placed in that memory space
+    instead of the default TPU HBM ("device"). This expresses *where a tensor lives* (host CPU vs
+    TPU) in the same type-driven style that `/d` and `/t` express *how it is split across chips*.
+    """
     mesh = jax._src.mesh.thread_resources.env.physical_mesh
-    return jax.tree_map(lambda spec: jax.sharding.NamedSharding(mesh, spec), make_partition_specs(cls))
+
+    def _sharding(spec):
+        if memory_kind is None:
+            return jax.sharding.NamedSharding(mesh, spec)
+        return jax.sharding.NamedSharding(mesh, spec, memory_kind=memory_kind)
+
+    return jax.tree_map(_sharding, make_partition_specs(cls))
 
 
 def typed_shard_map(f, **kwargs):

@@ -183,3 +183,33 @@ def index_unreduced(spec: str, table, indices):
 def axis_size(name: str) -> int:
     """Return the size of the axis with the given name."""
     return jax.lax.psum(1, name)
+
+
+# ---- Host <-> device memory placement --------------------------------------------------
+# seqax makes cross-*chip* movement explicit (all_gather / psum_scatter). These make
+# cross-*memory* movement explicit in the same spirit: a visible operation in the code that
+# moves a tensor between TPU HBM ("device") and pinned host CPU RAM ("pinned_host"), rather
+# than a hidden compiler decision. Used to park optimizer state in host RAM between steps and
+# stream it back to HBM only for the weight update.
+
+
+def _rememory(x, memory_kind: str):
+    """Return `x` placed in the given memory space, preserving its (chip) sharding spec."""
+    s = x.sharding
+    if not isinstance(s, jax.sharding.NamedSharding):
+        raise ValueError(f"to_host/to_device expect a NamedSharding, got {type(s).__name__}")
+    return jax.device_put(x, jax.sharding.NamedSharding(s.mesh, s.spec, memory_kind=memory_kind))
+
+
+def to_host(x):
+    """Explicitly move `x` from TPU HBM to pinned host (CPU) RAM.
+
+    The host-memory analogue of `all_gather`: an explicit data movement across the
+    host<->device boundary instead of across chips. The chip-sharding is unchanged.
+    """
+    return _rememory(x, "pinned_host")
+
+
+def to_device(x):
+    """Explicitly move `x` from pinned host (CPU) RAM back to TPU HBM."""
+    return _rememory(x, "device")
