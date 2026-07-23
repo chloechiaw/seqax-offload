@@ -94,6 +94,40 @@ def main():
                   f"-> transfer must live at the OUTER jit boundary")
             print("     ", str(e).splitlines()[0][:200])
 
+        # --- Q4: can the Adam update itself run ON the host (real ZeRO-Offload)? ---
+        # For the big win, mu/nu must never touch HBM: move the gradient to host, run the
+        # elementwise Adam update ON the host, and keep mu/nu resident on the host.
+        try:
+            from jax.experimental.compute_on import compute_on
+            have_compute_on = True
+        except Exception:
+            have_compute_on = False
+
+        if not have_compute_on:
+            print("Q4 host-side update: `jax.experimental.compute_on` NOT importable "
+                  "-> host-side update likely needs a JAX bump")
+        else:
+            try:
+                @jax.jit
+                def host_update(grad_dev, mu_host, nu_host):
+                    grad_host = shardops.to_host(grad_dev)  # HBM -> CPU
+                    with compute_on("device_host"):         # run the update ON the host CPU
+                        new_mu = 0.9 * mu_host + 0.1 * grad_host
+                        new_nu = 0.95 * nu_host + 0.05 * grad_host * grad_host
+                    return new_mu, new_nu
+
+                nm, nn = host_update(w, mu, nu)  # reuse w as a stand-in gradient
+                jax.block_until_ready((nm, nn))
+                hbm_after_host_update = peak_hbm_gib()
+                print(f"Q4 host-side update: OK -> real ZeRO-Offload viable; "
+                      f"new_mu.memory_kind = {nm.sharding.memory_kind} (want pinned_host)")
+                print(f"   peak HBM after host update = {hbm_after_host_update:.3f} GiB "
+                      f"(want ~unchanged; mu/nu stayed off-chip)")
+            except Exception as e:
+                print(f"Q4 host-side update: FAILED ({type(e).__name__}) "
+                      f"-> needs JAX bump, or do the update at the outer jit boundary")
+                print("     ", str(e).splitlines()[0][:200])
+
 
 if __name__ == "__main__":
     main()
