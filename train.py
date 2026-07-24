@@ -394,11 +394,19 @@ def training_step(
                 new_nu.append(nnu)
 
         treedef = jax.tree_util.tree_structure(state.weights)
-        # Keep the whole new state on the host for the next step (compute_on outputs can land on device).
+        # The host update loses the device sharding (host compute yields replicated arrays), so
+        # re-apply the correct host sharding (pinned_host + the model's partition spec) to every
+        # leaf, so the new state matches the sharding the step was compiled with.
+        host_shard = make_shardings(Model, memory_kind="pinned_host")
+
+        def _reshard(leaves):
+            tree = jax.tree_util.tree_unflatten(treedef, leaves)
+            return jax.tree.map(jax.device_put, tree, host_shard)
+
         new_state = State(
-            weights=jax.tree.map(shardops.to_host, jax.tree_util.tree_unflatten(treedef, new_w)),
-            adam_mu=jax.tree.map(shardops.to_host, jax.tree_util.tree_unflatten(treedef, new_mu)),
-            adam_nu=jax.tree.map(shardops.to_host, jax.tree_util.tree_unflatten(treedef, new_nu)),
+            weights=_reshard(new_w),
+            adam_mu=_reshard(new_mu),
+            adam_nu=_reshard(new_nu),
         )
         metrics = Metrics(
             loss=loss,
