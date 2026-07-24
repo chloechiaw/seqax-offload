@@ -294,6 +294,16 @@ class TrainingHparams:
     queue: Optional[str] = None
 
 
+# ZeRO-Offload toggle: with SEQAX_OFFLOAD=1, the whole training state (master weights + Adam
+# mu/nu) rests in host CPU RAM. Weights are streamed to HBM for the forward/backward pass, and
+# the Adam update runs on the host, so optimizer state never occupies HBM.
+OFFLOAD = os.environ.get("SEQAX_OFFLOAD") == "1"
+try:
+    from jax.experimental.compute_on import compute_on
+except Exception:
+    compute_on = None
+
+
 @pytree_dataclass
 class State:
     weights: Model
@@ -305,13 +315,99 @@ class State:
         weights = Model.init(hparams, rng)
         adam_mu = jax.tree.map(lambda p: p * 0.0, weights)
         adam_nu = jax.tree.map(lambda p: p * 0.0, weights)
-        return State(weights=weights, adam_mu=adam_mu, adam_nu=adam_nu)
+        state = State(weights=weights, adam_mu=adam_mu, adam_nu=adam_nu)
+        if OFFLOAD:
+            # Park the whole training state in host RAM (pinned_host). `to_host` in shardops is
+            # the explicit, in-code analogue of the cross-chip all_gather/psum_scatter.
+            state = State(
+                weights=jax.tree.map(shardops.to_host, state.weights),
+                adam_mu=jax.tree.map(shardops.to_host, state.adam_mu),
+                adam_nu=jax.tree.map(shardops.to_host, state.adam_nu),
+            )
+        return state
+
+
+def _lr_schedule(step, hparams):
+    warmup_lr = (jnp.float32(step) / jnp.float32(hparams.warmup_steps)) * hparams.learning_rate
+    cosine = jnp.cos(
+        jnp.pi * (jnp.float32(step - hparams.warmup_steps) / jnp.float32(hparams.steps_for_lr - hparams.warmup_steps))
+    )
+    cosine_lr = hparams.learning_rate * (
+        hparams.cosine_learning_rate_final_fraction
+        + (1 - hparams.cosine_learning_rate_final_fraction) * (cosine * 0.5 + 0.5)
+    )
+    return jnp.where(step < hparams.warmup_steps, warmup_lr, cosine_lr)
 
 
 @partial(jax.jit, static_argnums=(2, 3), donate_argnums=(0,))
 def training_step(
     state: State, step: u32[b""], h: Hparams, hparams: TrainingHparams, batch: TokenBatch
 ) -> Tuple[Any, Metrics]:
+    if OFFLOAD:
+        # ---- ZeRO-Offload: master weights + Adam mu/nu live on host; update runs on host. ----
+        # 1) Stream master weights host -> HBM for the forward/backward pass.
+        weights_dev = jax.tree.map(shardops.to_device, state.weights)
+
+        # 2) Forward/backward + global-norm gradient clipping on-device (the norm needs the
+        #    cross-chip reduction, hence inside shard_map). Return the *clipped* gradient.
+        @partial(shardtypes.typed_shard_map, check_rep=False)
+        def grad_step(weights: Model, batch: TokenBatch) -> Tuple[Model, f32[b""], f32[b""]]:
+            loss, grad = jax.value_and_grad(lambda w: w.loss(h, batch))(weights)
+            loss = jax.lax.psum(loss, ("d", "t"))
+            gns = jnp.float32(0.0)
+            for g in tree_leaves(grad):
+                gns += jnp.sum(jax.lax.square(g))
+            global_norm = jnp.sqrt(jax.lax.psum(gns, ("d", "t")))
+            rescale = jnp.minimum(1.0, 1.0 / global_norm)
+            grad = jax.tree.map(lambda g: g * rescale, grad)
+            return grad, loss, global_norm
+
+        grad_dev, loss, global_norm = grad_step(weights_dev, batch)
+
+        # 3) Move the (clipped) gradient HBM -> host and run AdamW ON THE HOST, so mu/nu and the
+        #    updated weights never occupy HBM.
+        grad_host = jax.tree.map(shardops.to_host, grad_dev)
+        lr = _lr_schedule(step, hparams)
+        completed_steps = step + 1
+        bc1 = 1 - jnp.float32(hparams.adam_b1) ** completed_steps
+        bc2 = 1 - jnp.float32(hparams.adam_b2) ** completed_steps
+
+        def adam_leaf(p, g, mu, nu):
+            mu = (1 - hparams.adam_b1) * g + hparams.adam_b1 * mu
+            nu = (1 - hparams.adam_b2) * jax.lax.square(g) + hparams.adam_b2 * nu
+            u = (mu / bc1) / (jnp.sqrt(nu / bc2 + hparams.adam_eps_root) + hparams.adam_eps)
+            u = (u + hparams.weight_decay * p) * lr
+            return p - u, mu, nu
+
+        assert compute_on is not None, "SEQAX_OFFLOAD=1 requires jax.experimental.compute_on"
+        with compute_on("device_host"):
+            new_w, new_mu, new_nu = [], [], []
+            for p, g, mu, nu in zip(
+                tree_leaves(state.weights),
+                tree_leaves(grad_host),
+                tree_leaves(state.adam_mu),
+                tree_leaves(state.adam_nu),
+            ):
+                np_, nmu, nnu = adam_leaf(p, g, mu, nu)
+                new_w.append(np_)
+                new_mu.append(nmu)
+                new_nu.append(nnu)
+
+        treedef = jax.tree_util.tree_structure(state.weights)
+        # Keep the whole new state on the host for the next step (compute_on outputs can land on device).
+        new_state = State(
+            weights=jax.tree.map(shardops.to_host, jax.tree_util.tree_unflatten(treedef, new_w)),
+            adam_mu=jax.tree.map(shardops.to_host, jax.tree_util.tree_unflatten(treedef, new_mu)),
+            adam_nu=jax.tree.map(shardops.to_host, jax.tree_util.tree_unflatten(treedef, new_nu)),
+        )
+        metrics = Metrics(
+            loss=loss,
+            learning_rate=lr,
+            grad_norm=jnp.minimum(global_norm, 1.0),
+            raw_grad_norm=global_norm,
+        )
+        return new_state, metrics
+
     @partial(
         shardtypes.typed_shard_map, check_rep=False
     )  # check_rep=False for https://github.com/google/jax/issues/20335
