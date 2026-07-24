@@ -401,7 +401,7 @@ def training_step(
 
         def _reshard(leaves):
             tree = jax.tree_util.tree_unflatten(treedef, leaves)
-            return jax.tree.map(jax.device_put, tree, host_shard)
+            return jax.tree.map(lambda x, s: jax.lax.with_sharding_constraint(x, s), tree, host_shard)
 
         new_state = State(
             weights=_reshard(new_w),
