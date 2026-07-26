@@ -18,6 +18,8 @@ import jax
 import jax.numpy as jnp
 import jax.profiler
 import numpy as np
+
+import slicemon_hook
 import zarr
 # from clearml import Logger  # optional; only used for remote logging
 from jax.experimental import multihost_utils
@@ -54,6 +56,7 @@ def log(step: int, logger, output: PyTree):
                 raise ValueError(f"Output {path} has unsupported shape {arr.shape} and dtype {arr.dtype}.")
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{now}] Step {step}: {metrics_dict}")
+        slicemon_hook.record(step, metrics_dict)
 
 
 def load_checkpoint_if_it_exists(checkpoint_dir: str, state: PyTree, config: IOConfig) -> Tuple[PyTree, int]:

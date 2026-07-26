@@ -26,8 +26,10 @@ from typeguard import typechecked
 import jax_extra
 import shardlib.shardops as shardops
 import shardlib.shardtypes as shardtypes
+import slicemon_hook
 import training_io
-from input_loader import FlatTokensParams, HuggingFaceDataParams, TokenBatch, TokenBatchParams, get_loader
+from input_loader import (FlatTokensParams, HuggingFaceDataParams, NanochatDataParams,
+                          TokenBatch, TokenBatchParams, get_loader)
 from jax_extra import explicit_activation_checkpointing, fold_in_str, save_for_backward
 from shardlib.shardtypes import Array, bf16, bool_, f32, make_shardings, pytree_dataclass, u32
 
@@ -508,6 +510,14 @@ def training_step(
 class Paths:
     root_working_dir: str
     model_name: str
+    # Directory for XLA's persistent compilation cache. Compiling the training step takes
+    # tens of seconds to minutes, and every process of every run repeats that work, because
+    # the compiler's output is only kept in the process's memory. Pointing this at shared
+    # storage (e.g. the same GCS bucket as root_working_dir) makes the first process to
+    # compile a given (HLO, device kind, XLA flags) publish its result, and every later
+    # process -- the other hosts in this run, and every subsequent run of the same config --
+    # load it instead of recompiling. None disables the cache.
+    compilation_cache_dir: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -527,18 +537,19 @@ class Config:
     io: training_io.IOConfig
     flat_tokens: Optional[FlatTokensParams] = None
     hf_dataset: Optional[HuggingFaceDataParams] = None
+    nanochat: Optional[NanochatDataParams] = None
 
     def __post_init__(self):
-        assert self.flat_tokens is not None or self.hf_dataset is not None, (
-            "Must provide either flat_tokens or hf_dataset."
-        )
-        assert not (self.flat_tokens is not None and self.hf_dataset is not None), (
-            "Should not specify both flat_tokens and hf_dataset."
+        sources = [self.flat_tokens, self.hf_dataset, self.nanochat]
+        provided = [s for s in sources if s is not None]
+        assert provided, "Must provide one of flat_tokens, hf_dataset, or nanochat."
+        assert len(provided) == 1, (
+            "Should specify exactly one of flat_tokens, hf_dataset, or nanochat."
         )
 
     @cached_property
-    def training_data(self) -> Union[FlatTokensParams, HuggingFaceDataParams]:
-        return self.flat_tokens or self.hf_dataset
+    def training_data(self) -> Union[FlatTokensParams, HuggingFaceDataParams, NanochatDataParams]:
+        return self.flat_tokens or self.hf_dataset or self.nanochat
 
 
 def main_contained(config, logger):
@@ -549,6 +560,16 @@ def main_contained(config, logger):
     # but hopefully faster in memory time because it's fusable.
     # TODO: check this is true and if not, provide our own that actually is fusable.
     jax.config.update("jax_threefry_partitionable", True)
+
+    # Reuse compiled programs across processes and across runs. Must be set before the first
+    # compilation below. We only cache programs that took over a second to compile, so that
+    # the cache holds the training step rather than the many trivial programs around it.
+    if config.paths.compilation_cache_dir is not None:
+        jax.config.update("jax_compilation_cache_dir", config.paths.compilation_cache_dir)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+        print(f"[compile] persistent compilation cache: {config.paths.compilation_cache_dir}")
+
     with Mesh(mesh_utils.create_device_mesh([config.mesh.d, config.mesh.t], jax.devices()), ("d", "t")):
         root_rng = jax.random.PRNGKey(config.training.seed)
 
@@ -579,6 +600,20 @@ def main_contained(config, logger):
             )
         except Exception as _e:
             print(f"[compile] memory_analysis unavailable: {_e}")
+        # Publish training-loop metrics for slicemon. Chip metrics can't tell you
+        # whether the work is useful -- MFU needs FLOPs/step and step time, which
+        # only live here.
+        slicemon_hook.configure(
+            model_name=config.paths.model_name,
+            params=jax.tree.reduce(operator.add, jax.tree.map(lambda w: w.size, state.weights)),
+            tokens_per_step=loader.load(start_step).targets.size,
+            device_flops=training_io.get_flops_per_device(),
+            num_devices=jax.device_count(),
+            mesh_d=config.mesh.d,
+            mesh_t=config.mesh.t,
+            total_steps=config.training.steps,
+        )
+
         date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         pass  # training_io.save_hlo_svg(os.path.join(model_dir, f"training_step_optimized_hlo_{date}.svg"), c_training_step)
 

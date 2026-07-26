@@ -23,6 +23,7 @@ https://docs.mosaicml.com/projects/streaming/en/stable/fundamentals/shuffling.ht
 
 import datetime
 import functools
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -373,12 +374,193 @@ class HuggingFaceDataLoader:
         return TokenBatch(tokens, is_start)
 
 
+@dataclass(frozen=True)
+class NanochatDataParams:
+    """Local parquet text shards, tokenized on the fly. No pre-tokenization step.
+
+    Pairs with karpathy/nanochat's data path: `python -m nanochat.dataset -n N`
+    downloads pre-shuffled parquet shards of raw text, and the tokenizer is a
+    BPE trained by `python -m scripts.tok_train` (default vocab 32768, which
+    matches seqax's existing model configs exactly).
+
+    Because the shards are already shuffled upstream, this loader reads them
+    linearly -- no shuffle buffer is needed.
+    """
+
+    data_dir: str
+    tokenizer_dir: Optional[str] = None   # dir containing nanochat's tokenizer.pkl
+    tiktoken_name: Optional[str] = None   # alternative: a tiktoken encoding name
+    val_shards: int = 1                   # last N shards held out for validation
+    doc_batch: int = 128                  # documents tokenized per call
+    encode_threads: int = 8
+
+
+class NanochatLoader:
+    """Reads parquet text shards and tokenizes in the data path.
+
+    Every host runs this identically and builds the whole global batch, then
+    `make_array_from_callback` slices out the shards it owns -- the same
+    approach HuggingFaceDataLoader takes. That means 8x redundant tokenization
+    on a v4-64, which is fine: a Rust BPE does ~1M tokens/s/core against the
+    ~260k tokens/s a 2B model consumes, so there is roughly 30x headroom.
+
+    Documents are packed BOS-aligned: each sequence starts a document, and a
+    document that doesn't fit the remaining space is cropped. That wastes some
+    tokens but keeps every token able to attend back to a document start.
+
+    Resume is approximate. The shards are pre-shuffled, so restarting mid-corpus
+    is statistically fine; we seek to a proportional offset rather than
+    replaying, because replaying 100k steps of tokenization would be absurd.
+    """
+
+    def __init__(self, split, config: NanochatDataParams, token_batch_params: TokenBatchParams):
+        import pyarrow.parquet as pq
+
+        self._pq = pq
+        self.config = config
+        self.batch_size = token_batch_params.batch
+        self.max_seq_len = token_batch_params.len
+        self.sharding = shardtypes.make_shardings(TokenBatch).targets
+
+        self.tokenizer = self._load_tokenizer(config)
+        self.max_token_id = self._vocab_size() - 1
+        self.bos_id = self._bos_id()
+
+        files = sorted(
+            os.path.join(config.data_dir, f)
+            for f in os.listdir(config.data_dir)
+            if f.endswith(".parquet")
+        )
+        if not files:
+            raise ValueError(
+                f"No parquet shards in {config.data_dir}. Run nanochat's "
+                f"`python -m nanochat.dataset -n N` first."
+            )
+        holdout = max(1, config.val_shards)
+        self.files = files[:-holdout] if split == "train" else files[-holdout:]
+
+        self._docs = None
+        self._next_step = 0
+
+    # -- tokenizer plumbing -------------------------------------------------
+
+    @staticmethod
+    def _load_tokenizer(config):
+        if config.tokenizer_dir:
+            from nanochat.tokenizer import RustBPETokenizer
+            return RustBPETokenizer.from_directory(config.tokenizer_dir)
+        if config.tiktoken_name:
+            try:
+                from nanochat.tokenizer import RustBPETokenizer
+                return RustBPETokenizer.from_pretrained(config.tiktoken_name)
+            except Exception:
+                import tiktoken
+                return tiktoken.get_encoding(config.tiktoken_name)
+        raise ValueError("Set either tokenizer_dir or tiktoken_name.")
+
+    def _vocab_size(self):
+        for attr in ("get_vocab_size", "n_vocab", "vocab_size"):
+            value = getattr(self.tokenizer, attr, None)
+            if callable(value):
+                return value()
+            if isinstance(value, int):
+                return value
+        raise ValueError("Could not determine tokenizer vocab size.")
+
+    def _bos_id(self):
+        for name in ("<|bos|>", "<|endoftext|>"):
+            try:
+                return self.tokenizer.encode_special(name)
+            except Exception:
+                continue
+        return getattr(self.tokenizer, "bos_token_id", 0)
+
+    def _encode(self, texts):
+        try:
+            out = self.tokenizer.encode(texts, num_threads=self.config.encode_threads)
+        except TypeError:
+            out = self.tokenizer.encode(texts)
+        if out and isinstance(out[0], int):   # tokenizer returned a flat list
+            return [out]
+        return out
+
+    # -- document stream ----------------------------------------------------
+
+    def _document_tokens(self):
+        """Infinite iterator of token lists, one per document, each BOS-prefixed."""
+        while True:
+            for path in self.files:
+                parquet = self._pq.ParquetFile(path)
+                for rg in range(parquet.num_row_groups):
+                    table = parquet.read_row_group(rg, columns=["text"])
+                    texts = table.column("text").to_pylist()
+                    for i in range(0, len(texts), self.config.doc_batch):
+                        for tokens in self._encode(texts[i:i + self.config.doc_batch]):
+                            yield [self.bos_id] + list(tokens)
+
+    def _seek(self, step):
+        """Approximate resume: skip proportionally into the (pre-shuffled) corpus."""
+        self._docs = self._document_tokens()
+        if step <= 0:
+            return
+        # Only whole shards are skipped; within a shard we accept the offset.
+        approx_tokens = step * self.batch_size * self.max_seq_len
+        # ~250M chars/shard at ~4 chars/token.
+        tokens_per_shard = 62_000_000
+        skip = int(approx_tokens // tokens_per_shard) % max(1, len(self.files))
+        if skip:
+            self.files = self.files[skip:] + self.files[:skip]
+            self._docs = self._document_tokens()
+
+    # -- batching -----------------------------------------------------------
+
+    def _fill(self):
+        """One global batch, BOS-aligned best-fit with cropping."""
+        total = self.batch_size * self.max_seq_len
+        flat = onp.full(total, self.bos_id, onp.uint32)
+        is_start = onp.zeros(total, onp.bool_)
+
+        pos = 0
+        while pos < total:
+            row_end = (pos // self.max_seq_len + 1) * self.max_seq_len
+            room = row_end - pos
+            doc = next(self._docs)
+            if len(doc) > room:
+                # Doesn't fit this row: crop to fill exactly, drop the tail.
+                doc = doc[:room]
+            is_start[pos] = True
+            flat[pos:pos + len(doc)] = doc
+            pos += len(doc)
+
+        shape = (self.batch_size, self.max_seq_len)
+        return flat.reshape(shape), is_start.reshape(shape)
+
+    def load(self, step):
+        if self._docs is None or step != self._next_step:
+            self._seek(step)
+        self._next_step = step + 1
+
+        batch, is_start = self._fill()
+        shape = (self.batch_size, self.max_seq_len)
+
+        def get_shard(x, indexing: Tuple[slice]):
+            return x[indexing]
+
+        tokens = jax.make_array_from_callback(shape, self.sharding, functools.partial(get_shard, batch))
+        starts = jax.make_array_from_callback(shape, self.sharding, functools.partial(get_shard, is_start))
+        return TokenBatch(tokens, starts)
+
+
 def get_loader(
-    split: str, config: Union[FlatTokensParams, HuggingFaceDataParams], token_batch_params: TokenBatchParams
+    split: str,
+    config: Union[FlatTokensParams, HuggingFaceDataParams, NanochatDataParams],
+    token_batch_params: TokenBatchParams,
 ):
     if isinstance(config, FlatTokensParams):
         return ShufflingLoader(split, config, token_batch_params)
     elif isinstance(config, HuggingFaceDataParams):
         return HuggingFaceDataLoader(split, config, token_batch_params)
+    elif isinstance(config, NanochatDataParams):
+        return NanochatLoader(split, config, token_batch_params)
     else:
         raise ValueError(f"Unknown config type {type(config)}")
