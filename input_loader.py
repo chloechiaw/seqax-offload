@@ -388,7 +388,10 @@ class NanochatDataParams:
     """
 
     data_dir: str
-    tokenizer_dir: Optional[str] = None   # dir containing nanochat's tokenizer.pkl
+    # Directory holding tokenizer.pkl. Despite the nanochat provenance, that file
+    # is a plain pickled tiktoken Encoding, so we load it with tiktoken directly
+    # and the nanochat package is not a runtime dependency -- it only trained it.
+    tokenizer_dir: Optional[str] = None
     tiktoken_name: Optional[str] = None   # alternative: a tiktoken encoding name
     val_shards: int = 1                   # last N shards held out for validation
     doc_batch: int = 128                  # documents tokenized per call
@@ -446,43 +449,38 @@ class NanochatLoader:
 
     @staticmethod
     def _load_tokenizer(config):
+        """A tiktoken Encoding, however it was produced."""
+        import pickle
+
+        import tiktoken
+
         if config.tokenizer_dir:
-            from nanochat.tokenizer import RustBPETokenizer
-            return RustBPETokenizer.from_directory(config.tokenizer_dir)
+            path = os.path.join(config.tokenizer_dir, "tokenizer.pkl")
+            with open(path, "rb") as fh:
+                enc = pickle.load(fh)
+            if not isinstance(enc, tiktoken.Encoding):
+                raise ValueError(f"{path} is {type(enc)!r}, expected tiktoken.Encoding")
+            return enc
         if config.tiktoken_name:
-            try:
-                from nanochat.tokenizer import RustBPETokenizer
-                return RustBPETokenizer.from_pretrained(config.tiktoken_name)
-            except Exception:
-                import tiktoken
-                return tiktoken.get_encoding(config.tiktoken_name)
+            return tiktoken.get_encoding(config.tiktoken_name)
         raise ValueError("Set either tokenizer_dir or tiktoken_name.")
 
     def _vocab_size(self):
-        for attr in ("get_vocab_size", "n_vocab", "vocab_size"):
-            value = getattr(self.tokenizer, attr, None)
-            if callable(value):
-                return value()
-            if isinstance(value, int):
-                return value
-        raise ValueError("Could not determine tokenizer vocab size.")
+        return self.tokenizer.n_vocab
 
     def _bos_id(self):
         for name in ("<|bos|>", "<|endoftext|>"):
             try:
-                return self.tokenizer.encode_special(name)
+                return self.tokenizer.encode_single_token(name)
             except Exception:
                 continue
-        return getattr(self.tokenizer, "bos_token_id", 0)
+        return 0
 
     def _encode(self, texts):
-        try:
-            out = self.tokenizer.encode(texts, num_threads=self.config.encode_threads)
-        except TypeError:
-            out = self.tokenizer.encode(texts)
-        if out and isinstance(out[0], int):   # tokenizer returned a flat list
-            return [out]
-        return out
+        # encode_ordinary_* ignores special-token syntax rather than raising on
+        # it, which matters because raw web text contains arbitrary strings.
+        return self.tokenizer.encode_ordinary_batch(
+            texts, num_threads=self.config.encode_threads)
 
     # -- document stream ----------------------------------------------------
 

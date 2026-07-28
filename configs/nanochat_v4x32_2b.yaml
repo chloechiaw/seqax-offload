@@ -1,0 +1,69 @@
+# python -m train --config-name=nanochat_v4x32_2b +paths.model_name=nc2b
+#
+# Dense 2B on 32 v4 chips, fed by nanochat's data path: pre-shuffled parquet
+# text shards tokenized on the fly. No pre-tokenization step.
+#
+# Prerequisites, on every worker:
+#   cd ~/nanochat
+#   python -m nanochat.dataset -n 900   # download text shards (~90GB, no tokenizing)
+#   python -m scripts.tok_train         # train the BPE, vocab 32768, minutes
+#
+# nanochat's default vocab (32,768) is exactly seqax's, so the model block below
+# is unchanged from c4_v4x32_2b.yaml.
+defaults:
+- c4_a100x8_base
+- _self_
+
+num_hosts: 8
+
+mesh:
+  d: 32
+  t: 1
+
+# The parent sets flat_tokens; null it out so exactly one data source is active.
+flat_tokens: null
+
+nanochat:
+  # seqax's config converter calls str() on these -- no ~ expansion -- so the
+  # path has to be resolved by OmegaConf, not the shell.
+  data_dir: ${oc.env:HOME}/.cache/nanochat/base_data_climbmix
+  tokenizer_dir: ${oc.env:HOME}/.cache/nanochat/tokenizer
+  val_shards: 1
+  doc_batch: 128
+  encode_threads: 8
+
+paths:
+  root_working_dir: 'gcs://tpu-research-2026-seqax/seqax'   # Fill in -- checkpoints must
+                                                # survive a host restart.
+
+# 2-day schedule: 86,000 x 524,288 = 45B tokens = 21 tokens/param (Chinchilla).
+# Re-derive with pick_steps.py once you have a measured step time.
+#
+# len=2048 rather than 1024, decided by measurement on this corpus: median
+# document is 530 tokens, so a 1024-token row fits one document plus a fragment
+# that gets cropped -- 38% of tokens wasted, leaving only 1.17x the raw corpus a
+# 45B budget needs. At 2048 waste drops to 26% and the margin rises to 1.40x.
+# Costs a larger f32 attention-logit transient (~2.15 GiB/layer vs 537 MiB); the
+# smoke run is what confirms it fits.
+training:
+  steps:         86000
+  steps_for_lr:  86000
+  warmup_steps:   8600
+  learning_rate: 3.0e-4
+  tokens:
+    batch: 256
+    len: 2048
+
+model:
+  d_model: 4096
+  n_q_per_kv: 1
+  n_kv: 16
+  d_head: 128
+  layers: 8
+  d_ff: 16384
+  vocab: 32768
+  rope_max_timescale: 10000
+
+# ~35 min between checkpoints at ~1s/step. Frequent enough that a crash costs
+# little, rare enough that GCS writes don't eat the run.
+checkpoint_interval: 2000
