@@ -612,6 +612,8 @@ def main_contained(config, logger):
             mesh_d=config.mesh.d,
             mesh_t=config.mesh.t,
             total_steps=config.training.steps,
+            seq_len=config.training.tokens.len,
+            batch=config.training.tokens.batch,
         )
 
         date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")

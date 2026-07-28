@@ -49,6 +49,73 @@ def psum_scatter(spec: str, x):
     return x
 
 
+def all_to_all(spec: str, x):
+    """String-specified all-to-all operation, which moves a sharding between two axes.
+
+    Unlike all_gather and psum_scatter, this neither replicates nor reduces: the tensor
+    stays fully sharded over the same mesh axes, and the same total bytes are resident
+    before and after. Only *which* tensor axis carries the sharding changes.
+
+    For example:
+      all_to_all('B L/t M -> B/t L M', x)
+
+    Here `x` is sharded over `t` along its length axis on input, and over `t` along its
+    batch axis on output. Each chip sends every other chip the slice of `B` that chip
+    will own, and receives the slices of `L` it was missing.
+
+    Cost: with `n` chips on the moved axis, each chip sends and receives `(n-1)/n` of its
+    local tensor, versus `(n-1)/n` sent-and-received-and-*retained* for an all_gather of
+    the same tensor. So the wire traffic is comparable to an all_gather, but the memory
+    afterwards is `1/n` of it -- which is the whole reason to reach for this operation.
+
+    Exactly one axis must lose sharding and exactly one must gain it, and they must move
+    the same mesh axes.
+    """
+    before, after = spec.split("->")
+    before = shardtypes.ShapeSpec.parse(before)
+    after = shardtypes.ShapeSpec.parse(after)
+    shardtypes.check(x.dtype, before, x)
+    if len(before.dims) != len(after.dims):
+        raise ValueError(f"Cannot all-to-all {before} into {after}: different ranks")
+
+    src = None  # axis losing sharding, so it gets concatenated back together
+    dst = None  # axis gaining sharding, so it gets split up
+    for i, (before_dim, after_dim) in enumerate(zip(before.dims, after.dims)):
+        if before_dim.shape != after_dim.shape:
+            raise ValueError(f"Cannot all-to-all {before_dim} into {after_dim}: shapes differ")
+        if before_dim.sharding == after_dim.sharding:
+            continue
+        after_n = len(after_dim.sharding)
+        before_n = len(before_dim.sharding)
+        if before_dim.sharding[:after_n] == after_dim.sharding:
+            if src is not None:
+                raise ValueError(f"Cannot all-to-all {before} into {after}: more than one axis loses sharding")
+            src = i
+        elif after_dim.sharding[:before_n] == before_dim.sharding:
+            if dst is not None:
+                raise ValueError(f"Cannot all-to-all {before} into {after}: more than one axis gains sharding")
+            dst = i
+        else:
+            raise ValueError(f"Cannot all-to-all {before_dim} into {after_dim}: shardings are not nested")
+
+    if src is None or dst is None:
+        raise ValueError(
+            f"Cannot all-to-all {before} into {after}: need exactly one axis losing sharding and one gaining it. "
+            f"To replicate a sharding use all_gather; to reduce one use psum_scatter."
+        )
+
+    moved = tuple(before.dims[src].sharding[len(after.dims[src].sharding) :])
+    gained = tuple(after.dims[dst].sharding[len(before.dims[dst].sharding) :])
+    if moved != gained:
+        raise ValueError(f"Cannot all-to-all {before} into {after}: axis {src} drops {moved} but axis {dst} adds {gained}")
+
+    # `split_axis` is the axis we cut into per-destination-chip pieces (the one gaining the
+    # sharding); `concat_axis` is the axis we glue the received pieces onto (the one losing it).
+    x = lax.all_to_all(x, moved, split_axis=dst, concat_axis=src, tiled=True)
+    shardtypes.check(x.dtype, after, x)
+    return x
+
+
 def einsum_unreduced(spec: str, x, y, **kwargs):
     """Ordinary chip-local einsum, but with sharding-aware typechecking.
 
