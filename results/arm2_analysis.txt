@@ -1,0 +1,22 @@
+v6e, 2B, len=1024. arm0 = 8 chips 1 slice. arm1/arm2 = 16 chips, 2 slices.
+arm1 = weights replicated, gradients all-reduced over DCN (the 'correct' hierarchy)
+arm2 = FSDP stretched across both slices, weights gathered over DCN (the 'wrong' one)
+
+ tok/chip   arm0   arm1   arm2 |   exp1   exp2 |  tok/s a1  tok/s a2  a2 gain
+     2048   188m  1375m  1062m |  1188m   875m |    23,831    30,840    1.29x
+     4096   250m  1312m  1062m |  1062m   812m |    49,932    61,681    1.24x
+     8192   438m  1438m  1188m |  1000m   750m |    91,181   110,376    1.21x
+    16384   875m  1875m  1625m |  1000m   750m |   139,810   161,319    1.15x
+
+best 8-chip (arm0):  149,797 tok/s
+best 16-chip arm1:   139,810 tok/s   (0.93x vs 8 chips)
+best 16-chip arm2:   161,319 tok/s   (1.08x vs 8 chips)
+
+
+SEQUENCE LENGTH: same 8192 tok/chip reached via len=2048 instead of batch
+
+          config   len  compute    step  exposed      r  retained  1/(1+r)
+            arm1  1024     438m   1438m    1000m   2.29     0.304    0.304
+            arm1  2048     500m   1438m     938m   1.88     0.348    0.348
+            arm2  1024     438m   1188m     750m   1.71     0.368    0.368
+            arm2  2048     500m   1188m     688m   1.38     0.421    0.421

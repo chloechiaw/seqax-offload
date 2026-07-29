@@ -1,0 +1,22 @@
+v6e within-slice scaling. ONE host, no DCN anywhere. tokens/chip held fixed,
+so batch scales with chip count and perfect scaling = IDENTICAL step time.
+
+ tok/chip  chips  batch  step ms      tok/s  tok/s/chip  vs prev
+     4096      2      8      312     26,214      13,107        -
+     4096      4     16      250     65,536      16,384    2.50x
+     4096      8     32      250    131,072      16,384    2.00x
+
+     8192      2     16      562     29,127      14,564        -
+     8192      4     32      438     74,898      18,725    2.57x
+     8192      8     64      438    149,797      18,725    2.00x
+
+4 -> 8 chips within a slice: exactly 2.00x. perfect linear scaling.
+2 chips is the outlier -- with weights sharded only 2 ways each chip holds ~14 GiB of model
+state instead of ~3.5, so it is memory-pressured, not interconnect-limited.
+
+THE CONTROL RESULT:
+  4 -> 8   chips, within one slice   2.00x   (perfect)
+  8 -> 16  chips, across two slices  0.93x   (worse than not doing it)
+
+same model, same code, same chips. the only difference is that the second doubling
+crosses the slice boundary. the model scales fine -- the interconnect does not.

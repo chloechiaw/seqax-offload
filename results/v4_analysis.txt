@@ -1,0 +1,11 @@
+v4, 2B model. arm0 = 16 chips 1 slice (no DCN). arm1 = 32 chips 2 slices.
+predicted DCN: 512 MiB/chip at 0.90 GB/s = 597 ms
+
+ tok/chip    arm0    arm1  exposed      r  retained  1/(1+r)  tok/s 16ch  tok/s 32ch  scaling
+     2048    438m    938m     500m   1.14     0.467    0.467      74,898      69,905    0.93x
+     4096    562m   1062m     500m   0.89     0.529    0.529     116,508     123,362    1.06x
+     8192    812m   1312m     500m   0.62     0.619    0.619     161,319     199,729    1.24x
+    16384   1500m   2000m     500m   0.33     0.750    0.750     174,763     262,144    1.50x
+
+exposed = arm1 - arm0, the DCN time not hidden by compute
+scaling = throughput of 32 chips / throughput of 16 chips (2.00x would be perfect)

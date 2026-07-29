@@ -1,0 +1,19 @@
+v6e MEASURED link bandwidth, per chip:  ICI 22.2 GB/s   DCN 0.9 GB/s -> ICI is 25x faster
+
+Model-size invariance: does model size move r = dcn/compute?
+
+ model        params  dcn MiB  compute   MFU0    arm1   t_dcn      r  retained
+  540m   671,123,456      320     312m  13.4%    625m    373m   1.19     0.500
+    1b 1,073,776,640      512     312m  18.4%    812m    597m   1.91     0.385
+    2b 2,147,553,280     1024     438m  25.2%   1438m   1193m   2.73     0.304
+
+All at 8192 tokens/chip. DCN bytes scale EXACTLY with params (320:512:1024 = 1:1.6:3.2,
+matching the parameter ratio). Compute does NOT: 312:312:438 = 1:1.0:1.4.
+
+The plan predicts model size cannot move r, since gradient bytes and compute are both linear
+in params. Bytes are. Compute is not -- MFU climbs 13.4% -> 18.4% -> 25.2% with model size,
+so a small model's compute time falls far less than its byte count does.
+
+Consequence: r GROWS with model size (1.20 -> 1.91 -> 2.72) and bigger models are hurt more
+by DCN at fixed tokens-per-chip. The invariance holds only under constant MFU, which does not
+hold for models small enough to underutilize the chip.

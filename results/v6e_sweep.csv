@@ -1,0 +1,9 @@
+run,arm,batch,device_kind,chips,tokens_per_chip,step_ms,mfu_pct,peak_hbm_gib,dcn_total_mib,dcn_predicted_ms,status
+arm0_b16,0,16,TPU v6 lite,8,2048,193.8,14.83,8.254,,,ok
+arm0_b32,0,32,TPU v6 lite,8,4096,260.4,22.08,10.792,,,ok
+arm0_b64,0,64,TPU v6 lite,8,8192,456.6,25.18,15.306,,,ok
+arm0_b128,0,128,TPU v6 lite,8,16384,877.5,26.21,24.382,,,ok
+arm1_b32,1,32,TPU v6 lite,16,2048,1337.2,2.15,8.806,1024.0,86,ok
+arm1_b64,1,64,TPU v6 lite,16,4096,1846.2,3.11,12.393,1024.0,86,ok
+arm1_b128,1,128,TPU v6 lite,16,8192,1859.5,6.18,19.065,1024.0,86,ok
+arm1_b256,1,256,TPU v6 lite,16,16384,1847.3,12.45,32.387,1024.0,86,ok

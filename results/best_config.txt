@@ -1,0 +1,13 @@
+2B model on v6e. Throughput = batch*1024 tokens / steady-state step time.
+
+                config  chips  batch  tok/chip  step ms      tok/s  tok/s/chip  HBM GiB
+    1 slice  (8 chips)      8     16      2048      188     87,381      10,923      8.3
+    1 slice  (8 chips)      8     32      4096      250    131,072      16,384     10.8
+    1 slice  (8 chips)      8     64      8192      438    149,797      18,725     15.3
+    1 slice  (8 chips)      8    128     16384      875    149,797      18,725     24.4
+   2 slices (16 chips)     16     32      2048     1375     23,831       1,489      8.8
+   2 slices (16 chips)     16     64      4096     1312     49,932       3,121     12.4
+   2 slices (16 chips)     16    128      8192     1438     91,181       5,699     19.1
+   2 slices (16 chips)     16    256     16384     1875    139,810       8,738     32.4
+
+BEST ABSOLUTE THROUGHPUT: 1 slice  (8 chips), batch 64 -> 149,797 tok/s on 8 chips

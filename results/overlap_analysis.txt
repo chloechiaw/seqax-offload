@@ -1,0 +1,7 @@
+run                         steady ms    n  2-step ms    delta
+overlap_async_all_reduce         1375   16       1611     +17%
+overlap_baseline                 1438   16       1418      -1%
+overlap_fuse_all_reduce          1562   16       1502      -4%
+overlap_nofusion                 1500   16       1970     +31%
+arm1_b128                        1438   16       1859     +29%
+arm0_b64                          438   16        457      +4%

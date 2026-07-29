@@ -1,0 +1,11 @@
+v6e 2x8 chips, 2B model. DCN = 1024 MiB/chip at measured 0.9 GB/s = 1193 ms
+step times = steady-state mean over 16 intervals (NOT the 2-step profile)
+
+ tok/chip  compute     arm1  exposed      r  retained  1/(1+r)   hidden
+     2048      188     1375     1188   6.36     0.136    0.136       3%
+     4096      250     1312     1062   4.77     0.190    0.173      52%
+     8192      438     1438     1000   2.73     0.304    0.268      44%
+    16384      875     1875     1000   1.36     0.467    0.423      22%
+
+exposed  = arm1 - compute, i.e. DCN time not hidden
+hidden   = fraction of COMPUTE overlapped with the transfer (100% = perfect overlap)
