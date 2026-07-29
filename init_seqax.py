@@ -4,7 +4,11 @@ import sys
 
 def set_variables():
     _gpu_flags = ""
-    if os.environ.get("SEQAX_CPU") != "1":
+    # These flags only exist in a jaxlib built with the GPU backend. A TPU-only
+    # jaxlib aborts on them the same way a CPU-only one does, so the gate has to
+    # exclude TPU as well -- jax isn't importable yet, hence the device nodes.
+    _on_tpu = os.path.exists("/dev/vfio") or os.path.exists("/dev/accel0")
+    if os.environ.get("SEQAX_CPU") != "1" and not _on_tpu:
         _gpu_flags = "--xla_gpu_enable_async_collectives=true --xla_gpu_enable_latency_hiding_scheduler=true "
     # Only set XLA_FLAGS if there's real content — a whitespace-only value makes
     # XLA treat it as a filename and abort (happens with SEQAX_CPU=1 and no prior flags).
