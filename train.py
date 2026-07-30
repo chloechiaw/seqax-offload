@@ -134,80 +134,80 @@ class Model:
         return jax.tree.map(lax.with_sharding_constraint, arrays, shardings)
 
     @typechecked
-    def forward_pass(self, h: Hparams, ids: u32[b"B/d L"], is_seq_start: bool_[b"B/d L"]) -> f32[b"B/d L V/t"]:
+    def forward_pass(self, h: Hparams, ids: u32[b"B/data/d L"], is_seq_start: bool_[b"B/data/d L"]) -> f32[b"B/data/d L V/t"]:
         ##### Initial embedding lookup.
         embed = shardops.all_gather("V/t M/d -> V/t M", jnp.bfloat16(self.embed))
-        x = shardops.index_unreduced("[V/t] M, B/d L -> B/d L M", embed, ids)
-        x = shardops.psum_scatter("B/d L M -> B/d L M/t", x)
+        x = shardops.index_unreduced("[V/t] M, B/data/d L -> B/data/d L M", embed, ids)
+        x = shardops.psum_scatter("B/data/d L M -> B/data/d L M/t", x)
 
         L = ids.shape[1]
         segment_ids = jnp.cumsum(is_seq_start, axis=1)
-        segment_mask: bool_[b"B/d L L"] = segment_ids[:, :, jnp.newaxis] == segment_ids[:, jnp.newaxis, :]
-        segment_mask: bool_[b"B/d L L 1 1"] = segment_mask[
+        segment_mask: bool_[b"B/data/d L L"] = segment_ids[:, :, jnp.newaxis] == segment_ids[:, jnp.newaxis, :]
+        segment_mask: bool_[b"B/data/d L L 1 1"] = segment_mask[
             ..., jnp.newaxis, jnp.newaxis
         ]  # add axes for q_per_k, num_kv_heads dimensions
         causal_mask: bool_[b"1 L L 1 1"] = jnp.tril(jnp.ones((L, L), dtype=jnp.bool_), 0)[
             jnp.newaxis, ..., jnp.newaxis, jnp.newaxis
         ]
-        causal_mask: bool_[b"B/d L L 1 1"] = jnp.logical_and(segment_mask, causal_mask)
+        causal_mask: bool_[b"B/data/d L L 1 1"] = jnp.logical_and(segment_mask, causal_mask)
 
         rope_table = RopeTable.create(L, h)
 
         ##### Transformer blocks.
         @explicit_activation_checkpointing
         @typechecked
-        def loop_body(x: bf16[b"B/d L M/t"], layer_weights: TransformerLayer) -> Tuple[bf16[b"B/d L M/t"], Tuple[()]]:
+        def loop_body(x: bf16[b"B/data/d L M/t"], layer_weights: TransformerLayer) -> Tuple[bf16[b"B/data/d L M/t"], Tuple[()]]:
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
-            gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
+            gx = shardops.all_gather("B/data/d L M/t -> B/data/d L M", x)
             nx = jnp.bfloat16(rms_norm(gx) * ln1)
 
             # Attention, using Grouped Query Attention and RoPE position embeddings.
             w_q = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_q))
-            q = save_for_backward(shardops.einsum_unreduced("B/d L M, M Q K/t D -> B/d L Q K/t D", nx, w_q))
+            q = save_for_backward(shardops.einsum_unreduced("B/data/d L M, M Q K/t D -> B/data/d L Q K/t D", nx, w_q))
             q = rope_table.apply("L D -> 1 L 1 1 D", q)
             w_kv = shardops.all_gather("2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(layer_weights.w_kv))
-            k, v = shardops.einsum_unreduced("B/d L M, k_v M K/t D -> k_v B/d L K/t D", nx, w_kv)
+            k, v = shardops.einsum_unreduced("B/data/d L M, k_v M K/t D -> k_v B/data/d L K/t D", nx, w_kv)
             k = save_for_backward(k)
             v = save_for_backward(v)
             k = rope_table.apply("L d -> 1 L 1 d", k)
             logits = shardops.einsum_unreduced(
-                "B/d Qlen Q K/t D, B/d Klen K/t D -> B/d Qlen Klen Q K/t", q, k, preferred_element_type=jnp.float32
+                "B/data/d Qlen Q K/t D, B/data/d Klen K/t D -> B/data/d Qlen Klen Q K/t", q, k, preferred_element_type=jnp.float32
             )
             logits = jnp.where(causal_mask, logits, -1e10)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
-            attn_out = shardops.einsum_unreduced("B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v)
+            attn_out = shardops.einsum_unreduced("B/data/d Qlen Klen Q K/t, B/data/d Klen K/t D -> B/data/d Qlen Q K/t D", probs, v)
             w_o = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_o))
-            attn_out = shardops.einsum_unreduced("B/d Qlen Q K/t D, M Q K/t D -> B/d Qlen M", attn_out, w_o)
-            attn_out = shardops.psum_scatter("B/d Qlen M -> B/d Qlen M/t", attn_out)
+            attn_out = shardops.einsum_unreduced("B/data/d Qlen Q K/t D, M Q K/t D -> B/data/d Qlen M", attn_out, w_o)
+            attn_out = shardops.psum_scatter("B/data/d Qlen M -> B/data/d Qlen M/t", attn_out)
             x = save_for_backward(x + attn_out)
 
             # Pre-FFN RMSNorm
             ln2 = save_for_backward(shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln2)))
-            gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
+            gx = shardops.all_gather("B/data/d L M/t -> B/data/d L M", x)
             nx = jnp.bfloat16(rms_norm(gx) * ln2)
 
             # FFN, using SwiGLU
             w_gate = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_gate))
-            gate_proj = save_for_backward(shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_gate))
+            gate_proj = save_for_backward(shardops.einsum_unreduced("B/data/d L M, M F/t -> B/data/d L F/t", nx, w_gate))
             w_up = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_up))
-            up_proj = save_for_backward(shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_up))
+            up_proj = save_for_backward(shardops.einsum_unreduced("B/data/d L M, M F/t -> B/data/d L F/t", nx, w_up))
             y = jax.nn.swish(gate_proj) * up_proj
             w_down = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_down))
-            ffn_out = shardops.einsum_unreduced("B/d L F/t, M F/t -> B/d L M", y, w_down)
-            ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
+            ffn_out = shardops.einsum_unreduced("B/data/d L F/t, M F/t -> B/data/d L M", y, w_down)
+            ffn_out = shardops.psum_scatter("B/data/d L M -> B/data/d L M/t", ffn_out)
 
             return jnp.bfloat16(x + ffn_out), ()
 
         x, () = jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
 
         ##### Final layernorm and output projection.
-        x = shardops.all_gather("B/d L M/t -> B/d L M", x)
+        x = shardops.all_gather("B/data/d L M/t -> B/data/d L M", x)
         ln = shardops.all_gather("M/t/d -> M", jnp.float32(self.final_layer_norm))
         x = jnp.bfloat16(rms_norm(x) * ln)
         unembed = shardops.all_gather("V/t M/d -> V/t M", jnp.bfloat16(self.unembed))
         logits = shardops.einsum_unreduced(
-            "B/d L M, V/t M -> B/d L V/t", x, unembed, preferred_element_type=jnp.float32
+            "B/data/d L M, V/t M -> B/data/d L V/t", x, unembed, preferred_element_type=jnp.float32
         )
 
         return logits
@@ -221,20 +221,20 @@ class Model:
         # which we get by shifting the targets right by 1 and
         # masking sequence-start tokens to 0.
         inputs = jnp.pad(batch.targets[:, :-1], pad_width=((0, 0), (1, 0)))
-        is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
-        inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
+        is_seq_start: bool_[b"batch/data/d len"] = batch.is_seq_start
+        inputs: u32[b"batch/data/d len"] = jnp.where(is_seq_start, 0, inputs)
 
-        logits: f32[b"batch/d len V/t"] = self.forward_pass(h, inputs, is_seq_start)
-        max_logits: f32[b"batch/d len 1"] = lax.pmax(jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t")
+        logits: f32[b"batch/data/d len V/t"] = self.forward_pass(h, inputs, is_seq_start)
+        max_logits: f32[b"batch/data/d len 1"] = lax.pmax(jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t")
         logits = logits - max_logits
         sum_logits = lax.psum(jnp.sum(jnp.exp(logits), axis=-1, keepdims=True), "t")
         logsumexp = jnp.log(sum_logits)
-        logprobs: f32[b"batch/d len V/t"] = logits - logsumexp
+        logprobs: f32[b"batch/data/d len V/t"] = logits - logsumexp
         logprobs_at_targets = shardops.index_unreduced(
-            "batch/d len [V/t], batch/d len -> batch/d len", logprobs, batch.targets
+            "batch/data/d len [V/t], batch/data/d len -> batch/data/d len", logprobs, batch.targets
         )
-        logprobs_at_targets = shardops.psum_scatter("batch/d len -> batch/d len/t", logprobs_at_targets)
-        tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
+        logprobs_at_targets = shardops.psum_scatter("batch/data/d len -> batch/data/d len/t", logprobs_at_targets)
+        tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, shardtypes.all_axes())
         return -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
 
 
@@ -266,7 +266,7 @@ class RopeTable:
 
 
 @typechecked
-def rms_norm(x: bf16[b"batch/d len M"]) -> bf16[b"batch/d len M"]:
+def rms_norm(x: bf16[b"batch/data/d len M"]) -> bf16[b"batch/data/d len M"]:
     mean2 = save_for_backward(jnp.mean(jax.lax.square(jnp.float32(x)), axis=-1, keepdims=True))
     return jnp.bfloat16(x * jax.lax.rsqrt(mean2 + 1e-6))
 
@@ -355,11 +355,11 @@ def training_step(
         @partial(shardtypes.typed_shard_map, check_rep=False)
         def grad_step(weights: Model, batch: TokenBatch) -> Tuple[Model, f32[b""], f32[b""]]:
             loss, grad = jax.value_and_grad(lambda w: w.loss(h, batch))(weights)
-            loss = jax.lax.psum(loss, ("d", "t"))
+            loss = jax.lax.psum(loss, shardtypes.all_axes())
             gns = jnp.float32(0.0)
             for g in tree_leaves(grad):
                 gns += jnp.sum(jax.lax.square(g))
-            global_norm = jnp.sqrt(jax.lax.psum(gns, ("d", "t")))
+            global_norm = jnp.sqrt(jax.lax.psum(gns, shardtypes.all_axes()))
             rescale = jnp.minimum(1.0, 1.0 / global_norm)
             grad = jax.tree.map(lambda g: g * rescale, grad)
             return grad, loss, global_norm
@@ -429,7 +429,18 @@ def training_step(
         # amount of data parallelism.
         #
         # So we reduce the loss across chips _outside_ the autodiff.
-        loss = jax.lax.psum(loss, ("d", "t"))
+        loss = jax.lax.psum(loss, shardtypes.all_axes())
+
+        # ...but that automatic reduction only covers the axes the weights are SHARDED over,
+        # because it is the transpose of the weight all_gather. `data` never appears in a weight
+        # spec -- weights are replicated across slices, deliberately, so that gathering them
+        # stays on the fast network -- so nothing has yet combined the gradients that different
+        # slices computed from different batch shards. This is that step, and on a multi-slice
+        # mesh it is the single collective in the whole training step that crosses DCN.
+        #
+        # It is a no-op when `data` has size 1, which is what makes the single-slice path
+        # identical to what it was before any of this existed.
+        grad = shardops.all_reduce_tree(grad, over="data")
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
         # because weights and grads are already fully sharded, as checked below.
@@ -453,7 +464,7 @@ def training_step(
         for g in grad_leaves:
             assert g.dtype == jnp.float32
             global_norm_square += jnp.sum(jax.lax.square(g))
-        global_norm_square = jax.lax.psum(global_norm_square, ("d", "t"))
+        global_norm_square = jax.lax.psum(global_norm_square, shardtypes.all_axes())
         global_norm = jnp.sqrt(global_norm_square)
         rescale = jnp.minimum(1.0, 1.0 / global_norm)
 
@@ -522,8 +533,26 @@ class Paths:
 
 @dataclass(frozen=True)
 class MeshConfig:
+    """Mesh axes, split by which physical network carries them.
+
+    `d` and `t` are ICI axes: chips within one slice, connected by the fast interconnect.
+
+    `dcn` names the axes carried by the datacenter network *between* slices, as a
+    comma-separated "name:size" list. It is deliberately a string rather than a nested dict
+    so it survives a Hydra command-line override unchanged:
+
+        mesh.dcn=data:2          two slices, one DCN axis, gradients replicated across them
+        mesh.dcn=outer:2,inner:2 four slices arranged as a two-level DCN hierarchy
+        (unset)                  one slice -- exactly the previous behavior, no DCN at all
+
+    The total mesh is the product: with d=8, t=1 and dcn=data:2 that is 8 chips per slice
+    across 2 slices, 16 chips, and the `data` axis is the only one whose collectives pay
+    DCN bandwidth.
+    """
+
     d: int
     t: int
+    dcn: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -552,6 +581,92 @@ class Config:
         return self.flat_tokens or self.hf_dataset or self.nanochat
 
 
+def _parse_dcn(spec: Optional[str]) -> dict:
+    """Parse "data:2" or "outer:2,inner:2" into an ordered {name: size}."""
+    if not spec:
+        return {}
+    result = {}
+    for piece in spec.split(","):
+        name, sep, size = piece.partition(":")
+        name = name.strip()
+        if not name or not sep or not size.strip():
+            raise ValueError(f"Bad mesh.dcn entry {piece!r}: expected 'name:size', e.g. 'data:2'")
+        if name not in ("data", "d"):
+            raise ValueError(
+                f"mesh.dcn axis {name!r} is not supported. Use 'data:N' for the correct "
+                f"hierarchy (weights replicated across slices, only gradients cross DCN), or "
+                f"'d:N' to deliberately stretch the FSDP axis across slices -- the WRONG "
+                f"hierarchy, which puts weight gathering on the slow link. 'd:N' exists only "
+                f"to measure how bad that is; it is never what you want in production."
+            )
+        result[name] = int(size)
+    return result
+
+
+def build_mesh(mesh_config: MeshConfig) -> Mesh:
+    """Build the device mesh, and tell shardtypes which of its axes are DCN.
+
+    With no `dcn` this is exactly the previous behavior -- create_device_mesh over ("d", "t")
+    -- so a single-slice config is bit-for-bit the same program it was before this existed.
+
+    With `dcn`, the mesh is built by create_hybrid_device_mesh, which places chips within a
+    slice along the ICI axes and slices along the DCN axes. That function multiplies its two
+    shapes elementwise, so both must have the same length: every axis is carried by exactly
+    one network and takes a 1 in the other. DCN axes come first, matching the physical
+    hierarchy -- outermost/slowest first.
+    """
+    dcn = _parse_dcn(mesh_config.dcn)
+    replicas = dcn.get("data", 1)
+    d_stretch = dcn.get("d", 1)
+
+    # `data` exists in every configuration, size 1 when there is one slice. The shape specs say
+    # `B/data/d` unconditionally, so the axis has to be there for them to resolve; a size-1
+    # leading axis shards nothing and leaves the single-slice layout exactly as it was.
+    names = ("data", "d", "t")
+    ici_shape = (1, mesh_config.d, mesh_config.t)
+    # Each axis gets its slice-spanning factor here. `data` is the correct place for it.
+    # `d` is the wrong place, deliberately: it stretches the FSDP axis across slices so weight
+    # gathering has to cross DCN. That is arm 2.
+    dcn_shape = (replicas, d_stretch, 1)
+    expected = math.prod(ici_shape) * math.prod(dcn_shape)
+    avail = jax.device_count()
+    if expected > avail:
+        raise ValueError(
+            f"mesh data={replicas} d={mesh_config.d} t={mesh_config.t} needs {expected} devices "
+            f"but only {avail} are visible"
+        )
+    # A mesh smaller than the allocation is allowed, for chip-count scaling studies: hold
+    # tokens-per-chip fixed and vary how many chips participate. This only works on a
+    # SINGLE-HOST slice. On multi-host, the hosts whose chips are excluded still have to join
+    # every computation and fail with "Device assignment (Computations: N Replicas: 1...)" -
+    # verified on a 4-host v4-32. So the smallest usable unit there is the whole slice.
+    use = jax.devices()[:expected]
+    if expected < avail:
+        print(f"[mesh] using {expected} of {avail} visible devices (chip-count scaling study)")
+
+    if replicas == 1 and d_stretch == 1:
+        devices = mesh_utils.create_device_mesh(list(ici_shape), use)
+        mesh = Mesh(devices, names)
+        # Replicated-over but not DCN-carried: with one slice there is no slow network to
+        # account for, yet weights are still not sharded over `data`.
+        shardtypes.declare_mesh(mesh, dcn_axes=(), replica_axes=("data",))
+        return mesh
+
+    devices = mesh_utils.create_hybrid_device_mesh(ici_shape, dcn_shape, use)
+    mesh = Mesh(devices, names)
+    dcn_axes = tuple(n for n, f in zip(names, dcn_shape) if f > 1)
+    shardtypes.declare_mesh(mesh, dcn_axes=dcn_axes, replica_axes=("data",))
+    if d_stretch > 1:
+        print(
+            f"[mesh] WARNING: d spans {d_stretch} slices ({mesh_config.d} chips in-slice x "
+            f"{d_stretch}). Weight gathering will cross DCN. This is the wrong hierarchy and is "
+            f"only useful as a measurement. Byte counts below are an UPPER BOUND: the report "
+            f"charges every hop of a mixed ICI/DCN ring at DCN rate, when only the inter-slice "
+            f"hops actually pay it."
+        )
+    return mesh
+
+
 def main_contained(config, logger):
     """Main program, which does not access external services except as specified by config.paths or logger."""
     # Use partitionable (and hopefully fusable!) RNG.
@@ -570,7 +685,7 @@ def main_contained(config, logger):
         jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
         print(f"[compile] persistent compilation cache: {config.paths.compilation_cache_dir}")
 
-    with Mesh(mesh_utils.create_device_mesh([config.mesh.d, config.mesh.t], jax.devices()), ("d", "t")):
+    with build_mesh(config.mesh):
         root_rng = jax.random.PRNGKey(config.training.seed)
 
         loader = get_loader("train", config.training_data, config.training.tokens)
@@ -600,6 +715,14 @@ def main_contained(config, logger):
             )
         except Exception as _e:
             print(f"[compile] memory_analysis unavailable: {_e}")
+
+        # What this step pushes across the slow network, known before a single step has run.
+        # Two things make this worth printing rather than reading off a profile afterwards:
+        # it catches a mesh whose hierarchy does not match the network (weight gathering on
+        # DCN) at trace time instead of after a wasted run, and it supplies the numerator for
+        # a bandwidth measurement -- a profiler saying a collective took 4.2 ms means nothing
+        # until you know how many bytes it moved.
+        print(shardtypes.dcn_report(training_io.get_dcn_bandwidth_per_chip()))
         # Publish training-loop metrics for slicemon. Chip metrics can't tell you
         # whether the work is useful -- MFU needs FLOPs/step and step time, which
         # only live here.
@@ -625,7 +748,18 @@ def main_contained(config, logger):
 
             # We profile on the second step, because the first step has a long pause for XLA
             # compilation and initial shuffle buffer loading.
-            if jax.process_index() == 0 and step == start_step + 1:
+            #
+            # The trace capture itself is opt-in, because it KILLS multi-host runs. Only
+            # process 0 enters this block, and stop_profile below spends ~30s writing perfetto
+            # traces while every other host sits waiting in a collective; the slice then aborts
+            # with "The program continuator has halted unexpectedly" at step 3. Single-host runs
+            # survive it, which is why it went unnoticed.
+            #
+            # The time.time() measurement stays unconditional -- it is what the MFU line reads,
+            # and it costs nothing. Set SEQAX_PROFILE=1 to capture an actual trace, which is
+            # only safe on a single-host slice.
+            _want_trace = os.environ.get("SEQAX_PROFILE") == "1"
+            if _want_trace and jax.process_index() == 0 and step == start_step + 1:
                 jax.block_until_ready(state)
                 training_io.start_profile()
                 profile_start = time.time()
@@ -633,7 +767,18 @@ def main_contained(config, logger):
             state, output = c_training_step(state, jnp.uint32(step), loader.load(step))
 
             # Run profile for two steps, to include data loading time in between them.
-            if jax.process_index() == 0 and step == start_step + 2:
+            #
+            # This entire block is process-0-only and sits between two steps: block_until_ready,
+            # trace capture, memory_analysis, memory_stats, several prints. On a single host that
+            # is harmless. On a multi-host slice it is fatal - process 0 stops enqueuing while
+            # the other hosts sit in collectives, and the program dies at the next step with
+            # "The program continuator has halted unexpectedly". Gating only the trace capture
+            # was not enough; the whole asymmetry has to go.
+            #
+            # So it is opt-in via SEQAX_PROFILE=1, safe on a single-host slice. For multi-host,
+            # take step time from the per-step log timestamps instead (tools/step_times.py),
+            # which is both survivable and more accurate than this two-step sample.
+            if _want_trace and jax.process_index() == 0 and step == start_step + 2:
                 jax.block_until_ready(state)
                 profile_duration = time.time() - profile_start
                 training_io.stop_profile(model_dir)

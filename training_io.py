@@ -23,7 +23,12 @@ import slicemon_hook
 import zarr
 # from clearml import Logger  # optional; only used for remote logging
 from jax.experimental import multihost_utils
-from jax.lib import xla_client
+try:
+    # Removed from jax.lib in newer jax. Only save_hlo_svg() needs it, and that
+    # is not on the training path, so a missing xla_client must not block import.
+    from jax.lib import xla_client
+except ImportError:
+    xla_client = None
 from numcodecs import blosc
 
 PyTree = Any
@@ -285,3 +290,21 @@ def get_flops_per_device():
     print(f"Device kind: {device}")
     print(f"FLOPS per device: {result:_}")
     return result
+
+
+def get_dcn_bandwidth_per_chip():
+    """Datacenter-network bandwidth per chip, in GB/s, for the current device kind.
+
+    This is the *scale-out* bandwidth between slices, not the ICI bandwidth within one. It is
+    what turns "bytes crossing DCN" into "seconds", so it is only ever used for the predicted
+    time in the DCN report -- never for a measurement. Returns None for unknown devices, which
+    suppresses the prediction rather than printing a wrong one.
+    """
+    device = jax.devices()[0].device_kind
+    if device.startswith("TPU v6"):
+        return 12.5
+    elif device.startswith("TPU v4"):
+        return 6.25
+    elif device.startswith("TPU v5 lite") or device.startswith("TPU v5e"):
+        return 3.125
+    return None

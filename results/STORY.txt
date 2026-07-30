@@ -1,0 +1,48 @@
+==============================================================================
+v6e  (Trillium).  8 chips per slice.  2B model, seq len 1024.
+==============================================================================
+
+SWEEP 1 - does the chip scale INSIDE one slice?  (no slow network involved)
+  hold work-per-chip fixed, add chips. perfect = step time unchanged.
+
+   chips  batch  step ms   tokens/sec  vs half the chips
+       2      8      312       26,214                  -
+       4     16      250       65,536              2.50x
+       8     32      250      131,072              2.00x
+
+       2     16      562       29,127                  -
+       4     32      438       74,898              2.57x
+       8     64      438      149,797              2.00x
+
+  -> 4 to 8 chips is EXACTLY 2.00x, twice. inside a slice it scales perfectly.
+
+
+SWEEP 2 - does it scale ACROSS two slices?  three configurations compared
+  A = one slice only            (8 chips, no slow network)
+  B = two slices, weights COPIED to each, gradients summed across  (16 chips)
+  C = two slices, weights SPLIT across all of them                 (16 chips)
+
+   work/chip |  A step  B step  C step |   A tok/s   B tok/s   C tok/s
+        2048 |     188    1375    1062 |    87,381    23,831    30,840
+        4096 |     250    1312    1062 |   131,072    49,932    61,681
+        8192 |     438    1438    1188 |   149,797    91,181   110,376
+       16384 |     875    1875    1625 |   149,797   139,810   161,319
+
+  BEST OF EACH:
+    A  one slice,  8 chips                149,797 tok/s
+    B  two slices, 16 chips, copied       139,810 tok/s   0.93x  <- 2x the chips, LESS throughput
+    C  two slices, 16 chips, split        161,319 tok/s   1.08x  <- barely worth it
+
+==============================================================================
+v4.  16 chips per slice.  same model.
+==============================================================================
+
+   work/chip |  1 slice  2 slices |  16ch tok/s  32ch tok/s   gain
+        2048 |      438       938 |      74,898      69,905  0.93x
+        4096 |      562      1062 |     116,508     123,362  1.06x
+        8192 |      812      1312 |     161,319     199,729  1.24x
+       16384 |     1500      2000 |     174,763     262,144  1.50x
+
+  -> on v4 the second slice PAYS: 1.50x for 2x the chips.
+     on v6e it did not. same model, same code, opposite answer.
+

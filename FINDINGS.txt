@@ -1,0 +1,188 @@
+WHAT AN INTERCONNECT HOP COSTS - MEASURED
+seqax on TPU v4 and v6e, project tpu-research-2026
+runs 2026-07-28 / 2026-07-29
+
+Supersedes the predicted-time tables in DCN_HOP_EXPERIMENT.txt section 2,
+DCN_64CHIP_PLAN.txt section 3, and INHAND_SWEEP_PLAN.txt sections 1-2. Those were
+computed from assumed bandwidths that turn out to be wrong by about 14x. The code
+changes and operational notes in those files still stand.
+
+Raw data in results/. All of it survives without the TPUs.
+
+
+-------------------------------------------------------------------------------
+THE QUESTION
+-------------------------------------------------------------------------------
+
+What does one interconnect hop cost?
+
+Concretely: when a training job is split across two slices, so gradients must
+cross the datacenter network (DCN) instead of staying on the fast in-slice
+interconnect (ICI), how much throughput is lost - and what governs the size of
+that loss?
+
+
+-------------------------------------------------------------------------------
+WHAT HAD TO BE BUILT FIRST
+-------------------------------------------------------------------------------
+
+seqax could not express the question. The mesh was two hardcoded integers built
+with a constructor that assumes one uniform network, so it could not run
+multislice at all.
+
+  1. A mesh that knows which network carries which axis. `mesh.dcn=data:2`
+     splits ICI axes from DCN axes and builds via create_hybrid_device_mesh.
+     Unset, it collapses to exactly the previous behavior - verified identical
+     to within measurement noise on both generations.
+
+  2. A typed all_reduce - the gradient-sync operation. `over=` rather than an
+     arrow, because unlike all_gather and psum_scatter an all-reduce does not
+     change the sharding, so an arrow would carry no information.
+
+  3. Trace-time DCN accounting. Every collective reports the bytes it pushes
+     across the slow link BEFORE a step runs, plus a strict mode that turns a
+     mismatched hierarchy into a startup error rather than a slow run.
+
+Five seqax bugs blocked any of this running on current TPUs; all fixed except
+the profiler issue in finding 7.
+
+
+-------------------------------------------------------------------------------
+WHAT WAS RUN
+-------------------------------------------------------------------------------
+
+  link bandwidth      model-free microbenchmark, ICI and DCN, both generations
+  batch sweep         arm 0 (one slice) vs arm 1 (two slices, correct
+                      hierarchy) at matched tokens-per-chip, four points
+  overlap test        four XLA flag configurations at one operating point
+  model size          540m / 1b / 2b at fixed tokens-per-chip
+
+Hardware: 2 x v6e-8 (16 chips, europe-west4-a, spot) and 2 x v4-32 (32 chips,
+us-central2-b, on-demand). Model held fixed at the 2B config except where noted.
+
+
+-------------------------------------------------------------------------------
+FINDINGS
+-------------------------------------------------------------------------------
+
+1. THE ASSUMED BANDWIDTHS ARE WRONG BY 14x
+
+   Every predicted DCN time in the plans comes from 6.25 GB/s (v4) and 12.5
+   GB/s (v6e) per chip. Measured, by direct all-reduce of a known buffer:
+
+     v6e   0.90 GB/s per chip     v4   0.90-0.95 GB/s per chip
+
+   Cross-validated two ways: the microbenchmark and a full seqax step agree to
+   within 10 percent.
+
+2. THE TWO GENERATIONS HAVE IDENTICAL PER-CHIP DCN BANDWIDTH
+
+   The 2x that the plan attributes to v6e is real, but it lives at the HOST
+   level: v6e moves 7.2 GB/s per host against v4's 3.6, and puts twice as many
+   chips behind that NIC. Per chip it cancels exactly.
+
+   This kills the "85.9 ms twin" that INHAND_SWEEP_PLAN section 1 called the
+   sharpest thing in the experiment. That twin required v6e's 2x per-chip
+   bandwidth to offset its 2x larger gradient shard. Instead v6e pays twice as
+   much: about 1193 ms per gradient sync against v4's 597 ms.
+
+   The replacement claim is better: the scale-out penalty is set by CHIPS PER
+   SLICE and per-chip DCN bandwidth, and packing more compute behind the same
+   host NIC makes it worse, not better.
+
+3. ICI IS 25x FASTER THAN DCN
+
+     ICI  22.2 GB/s per chip        DCN  0.90 GB/s per chip
+
+   This is the number the "hierarchy must match the network" rule was asserted
+   without. It also makes the wrong hierarchy quantitative: weight gathering is
+   about 3.75 GiB per chip per forward pass, which is 181 ms on ICI and roughly
+   4500 ms on DCN.
+
+4. THE PENALTY CURVE, MEASURED
+
+   v6e, 2 slices of 8 chips, 2B model. Steady-state step times.
+
+     tok/chip   compute    arm1   exposed      r   retained
+         2048       188    1375      1188   6.36      0.136
+         4096       250    1312      1062   4.77      0.190
+         8192       438    1438      1000   2.73      0.304
+        16384       875    1875      1000   1.36      0.467
+
+   r = DCN time / compute time. retained = fraction of single-slice throughput.
+
+   At the HBM ceiling you still keep only 47 percent. THE KNEE IS UNREACHABLE
+   with 8 chips per slice - too few to shard a 2B gradient across. Getting to
+   r < 0.3 needs about 4x more tokens per chip than memory allows.
+
+5. OVERLAP IS CAPPED, NOT ABSENT
+
+   Exposed DCN time is flat at 1000-1190 ms across an 8x range of compute. At
+   the last point there are 875 ms of compute available to hide behind and only
+   193 ms gets hidden. The cap is fixed, not proportional to what is available.
+
+   No flag configuration changes it:
+
+     baseline                              1438 ms
+     xla_enable_async_all_reduce=true      1375 ms   (-4%)
+     all fusion off                        1500 ms
+     ..._fuse_all_reduce=true              1562 ms
+
+   The cause looks structural. init_seqax.py's flags name all_GATHER twice and
+   all_REDUCE never - they were tuned for FSDP weight gathering on ICI. And the
+   gradient all-reduce fires after the ENTIRE backward pass, when there is no
+   compute left in the step to overlap with. Fixing it needs bucketing - firing
+   the reduction on early-layer gradients while later layers still compute -
+   which is a change to where the collective is issued, not a compiler flag.
+
+6. MODEL SIZE DOES MOVE r, CONTRADICTING THE PLAN
+
+   At 8192 tokens/chip:
+
+      model    params   dcn MiB   compute   MFU      r   retained
+       540m    0.67e9       320     312ms  13.4%  1.19      0.500
+         1b    1.07e9       512     312ms  18.4%  1.91      0.385
+         2b    2.15e9      1024     438ms  25.2%  2.73      0.304
+
+   Gradient bytes scale EXACTLY with params (320:512:1024 is precisely the
+   parameter ratio). Compute does not (312:312:438), because MFU climbs with
+   model size - small models do not saturate the chip.
+
+   So bigger models are hurt MORE by DCN at fixed tokens-per-chip, and the
+   ratio sweep cannot be shortcut by shrinking the model. The plan's invariance
+   argument is right in algebra and wrong in practice: it assumes constant MFU.
+
+7. THE BUILT-IN PROFILE IS NOT A USABLE MEASUREMENT
+
+   train.py reports step time from a two-step window that is also the window
+   the profiler is attached to. Against itself on identical configs it varies
+   by up to 41 percent on communication-bound runs.
+
+   This is not academic: an earlier reading of these same runs concluded
+   "overlap is zero, throughput tracks 1/(1+r)". Steady-state timing from the
+   per-step log timestamps - reproducible to within 1 percent - gave finding 5
+   instead. tools/step_times.py does this from data already logged.
+
+   The profile number also drives the MFU line and slicemon_hook.
+
+
+-------------------------------------------------------------------------------
+STILL OPEN
+-------------------------------------------------------------------------------
+
+  arm 2, the wrong hierarchy. BLOCKED, interestingly: create_device_mesh
+  refuses to build a flat mesh spanning slices, because MegaScale devices carry
+  duplicate coords distinguished only by slice_id. The mesh API makes the
+  catastrophic misconfiguration hard to express - good design, inconvenient
+  here. Needs a deliberate escape hatch (mesh.dcn=d:2).
+
+  v4 arm 1. The missing half of the cross-generation comparison. Runs on
+  on-demand hardware, needs no new code. Tests whether the ~190 ms overlap cap
+  is a property of the hardware or of seqax.
+
+  gradient bucketing. The only route to real overlap, and the only route to
+  reaching the knee on slices this small.
+
+  v6e spot capacity. Six preemptions on 2026-07-29 across both granted zones,
+  the last living two minutes with a node already flagged UNHEALTHY_MAINTENANCE
+  at birth. The pool has no headroom; this is worth raising with TRC.

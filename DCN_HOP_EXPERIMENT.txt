@@ -1,0 +1,333 @@
+DCN HOP EXPERIMENT - MEASURING WHAT AN INTERCONNECT HOP COSTS
+seqax on TPU v4, project tpu-research-2026, zone us-central2-b
+written 2026-07-28
+
+This supersedes section 4 of MULTISLICE_PLAN.txt. Sections 0-3 of that file
+(setup, the minimal working checklist, the hybrid mesh feature) still apply.
+
+
+-------------------------------------------------------------------------------
+1. THE CORE IDEA
+-------------------------------------------------------------------------------
+
+You have 32 chips. How you carve them into slices decides how much of your
+communication runs on the fast network (ICI, inside a slice) versus the slow
+one (DCN, between slices, roughly 6.25 GB/s per chip on v4).
+
+With 2 slices you get exactly one DCN axis. One hop. That is a single data
+point.
+
+But 32 chips can be carved many ways, and each carving moves the ICI/DCN
+boundary to a different place:
+
+  slices   chips/slice   ICI spans   DCN mesh shape options
+  ------   -----------   ---------   ----------------------
+    1          32           32       none (this was your old v4-64)
+    2          16           16       (2,)
+    4           8            8       (4,)  or  (2,2)
+    8           4            4       (8,)  or  (4,2)  or  (2,2,2)
+
+That last column is the answer to "can I simulate multi-hop." A dcn_mesh_shape
+of (2,2) is two distinct DCN axes - a genuine two-level hierarchy. (2,2,2) is
+three levels. create_hybrid_device_mesh accepts a multi-dimensional
+dcn_mesh_shape, so this costs you nothing in code once the mesh is generalized.
+
+So the experiment is not two arms (right hierarchy vs wrong hierarchy). It is a
+SWEEP: slide the ICI/DCN boundary across its whole range and measure what
+happens. That produces a curve, and a curve generalizes past your specific
+config in a way that two numbers do not.
+
+
+-------------------------------------------------------------------------------
+2. PREDICTED NUMBERS - DO THIS ARITHMETIC BEFORE RUNNING ANYTHING
+-------------------------------------------------------------------------------
+
+Model: existing 2B config. Exactly 2^31 params. 8 layers, d_model 4096,
+d_ff 16384, vocab 32768.
+
+  weights in bf16   4.00 GiB
+  gradients in f32  8.00 GiB (global)
+  DCN bandwidth     ~6.25 GB/s per chip
+
+Arrangement in every case: shard weights over the chips WITHIN a slice (ICI),
+replicate across slices, so only the gradient all-reduce crosses DCN. This is
+the correct hierarchy - never let weight gathering cross DCN, see section 5.
+
+Ring all-reduce over n replicas moves 2(n-1)/n times the shard size per chip.
+
+  2 slices x 16 chips
+    gradient shard per chip = 8 GiB / 16 = 512 MiB
+    all-reduce over n=2     = 2(1/2) x 512 MiB = 512 MiB = 0.537 GB
+    DCN time                = 0.537 / 6.25 = about 86 ms
+
+  4 slices x 8 chips
+    gradient shard per chip = 8 GiB / 8 = 1 GiB
+    all-reduce over n=4     = 2(3/4) x 1 GiB = 1.5 GiB = 1.61 GB
+    DCN time                = 1.61 / 6.25 = about 258 ms
+
+  8 slices x 4 chips
+    gradient shard per chip = 8 GiB / 4 = 2 GiB
+    all-reduce over n=8     = 2(7/8) x 2 GiB = 3.5 GiB = 3.76 GB
+    DCN time                = 3.76 / 6.25 = about 601 ms
+
+  1 slice x 32 chips (the old v4-64, for reference)
+    zero DCN traffic
+
+Against a step time of roughly 1 second, that is:
+
+  1 slice    0 percent DCN
+  2 slices   about  9 percent
+  4 slices   about 26 percent
+  8 slices   about 60 percent
+
+THE SHAPE OF THIS CURVE IS THE RESULT. And notice WHY it steepens: as slices
+get smaller you pay twice. Each chip's gradient shard gets bigger (less
+in-slice sharding to divide it) AND the ring across slices gets longer. The
+penalty is superlinear in the number of hops.
+
+That is a genuinely useful thing to be able to state about scale-out
+interconnect, and it is exactly the tradeoff a chip company faces when deciding
+how large a tightly-coupled block should be before you have to go to the slower
+fabric.
+
+
+-------------------------------------------------------------------------------
+3. THE CODE CHANGES
+-------------------------------------------------------------------------------
+
+Three pieces. They build on each other.
+
+3.1  Generalize the mesh (required, blocks everything)
+
+     Today, train.py line 448:
+       Mesh(mesh_utils.create_device_mesh([config.mesh.d, config.mesh.t],
+            jax.devices()), ("d", "t"))
+
+     and line 409:
+       class MeshConfig:
+           d: int
+           t: int
+
+     Two ints, one flat network assumption.
+
+     Replace with named axes split explicitly into ici and dcn, built with
+     create_hybrid_device_mesh (already present in jax 0.4.35, verified):
+
+       mesh:
+         ici: {fsdp: 16, t: 1}
+         dcn: {data: 2}
+
+     and for multi-hop:
+
+       mesh:
+         ici: {fsdp: 4, t: 1}
+         dcn: {outer: 2, mid: 2, inner: 2}     # 8 slices, 3 DCN levels
+
+     Also update the hardcoded ("d","t") in the loss psum at train.py line 326.
+
+     Requirement: a config with dcn of size 1 must collapse to exactly today's
+     behavior. That keeps the change safe to propose upstream and gives you a
+     clean single-slice control arm.
+
+3.2  A typed all_reduce in shardlib (this is the piece you asked about)
+
+     Cross-slice gradient sync is an all-reduce. shardlib has no all_reduce.
+     Today the code calls jax.lax.psum raw (train.py 326, shardops.py 184),
+     which bypasses every shape and sharding check that the other ops get.
+
+     The design problem is interesting and worth having an opinion about.
+     all_gather and psum_scatter both CHANGE the sharding, so the arrow
+     notation carries real information - the difference between the two sides
+     IS the operation. An all_reduce does not change the sharding at all. The
+     arrow would read
+
+       all_reduce("M/fsdp -> M/fsdp", x)      # arrow says nothing
+
+     So break the convention deliberately, because the operation is genuinely a
+     different kind of thing:
+
+       all_reduce("M/fsdp", x, over="data")
+
+     Different API shape for a different kind of operation. Implement it the
+     same way as the others - parse the spec, shardtypes.check on the way in
+     and out, then jax.lax.psum over the named axes.
+
+3.3  Make DCN visible in the type system (the interesting part)
+
+     This is what "shows semantically the dcn difference" means concretely.
+
+     Every chip-to-chip operation in seqax is already a string with an arrow.
+     Once the mesh knows which axis names are DCN, shardops can tell you, at
+     trace time, which of your collectives touch the slow network and how many
+     bytes they push across it.
+
+     Implementation sketch: at mesh construction, record the set of DCN axis
+     names in a module-level registry in shardtypes. Then in all_gather,
+     psum_scatter and all_reduce, after parsing the spec, check whether any
+     axis being gathered/scattered/reduced is in that set. If so, accumulate
+     (source line, axis, bytes) into a list.
+
+     Print it at startup, next to the existing MFU line:
+
+       COLLECTIVES CROSSING DCN (per chip, per step)
+         train.py:326  all_reduce  grad over 'data'   512 MiB
+         ----------------------------------------------------
+         total                                        512 MiB
+         predicted DCN time at 6.25 GB/s              86 ms
+
+     Why this is worth building and not just instrumentation for its own sake:
+
+       a) It catches the catastrophic misconfiguration (section 5) at trace
+          time instead of after a wasted run. If weight gathering shows up in
+          this table, you stop immediately.
+       b) It gives you the numerator for a bandwidth measurement. The profiler
+          tells you a collective took 4.2 ms. That number alone is meaningless.
+          Bytes divided by time gives achieved bandwidth, which you compare to
+          the DCN rating - and THAT tells you whether to optimize or accept.
+       c) It is the seqax philosophy applied one step further. Their thesis is
+          that all interchip communication should be explicit and visible in
+          the source. This makes the EXPENSIVE communication visible, which is
+          the distinction that actually matters at scale.
+
+     Optional strictness, and a good default: a config flag that raises an
+     error if any collective other than an explicitly allowed list crosses DCN.
+     Turns a performance disaster into a startup failure.
+
+
+-------------------------------------------------------------------------------
+4. WHAT TO RUN
+-------------------------------------------------------------------------------
+
+4.1  Phase 1 - on the hardware you already have (2 x v4-32)
+
+     Do this first. The code is the blocker, not the hardware.
+
+       arm 0   single slice, 16 chips, seqax-ms-0 only. No DCN. Control.
+               Halve the batch to keep tokens-per-chip constant, otherwise you
+               are changing two variables at once.
+
+       arm 1   both slices, correct hierarchy.
+               ici {fsdp: 16, t: 1}, dcn {data: 2}
+               Predicted DCN cost about 86 ms per step.
+
+       arm 2   both slices, WRONG hierarchy - let fsdp span all 32 chips so
+               weight gathering crosses DCN. Predicted about 666 ms per step.
+               Expect this to be terrible. That is the point; it is the
+               experimental demonstration that the hierarchy has to match the
+               network. Run it briefly, record it, move on.
+
+     Measure per arm: step time, MFU, peak HBM per chip, and from the profile,
+     how much of the DCN collective overlapped with compute.
+
+     The overlap number is the one that matters most. Bytes tell you volume;
+     only the profile tells you whether the cost was hidden. A large transfer
+     that fully overlaps costs nothing.
+
+4.2  Phase 2 - re-provision for multi-hop
+
+     Only after phase 1 works end to end. Tear down seqax-ms-qr and request
+     smaller slices. The code from section 3 already handles any
+     dcn_mesh_shape, so this is a config change, not a code change - which is
+     exactly why you build the general version first.
+
+       4 x v4-16   ->  dcn {data: 4}      one DCN axis, longer ring
+                   ->  dcn {a: 2, b: 2}   TWO DCN axes, real two-level hierarchy
+
+       8 x v4-8    ->  dcn {a: 2, b: 2, c: 2}   three-level hierarchy
+
+     Request with:
+       gcloud compute tpus queued-resources create seqax-ms4-qr \
+         --project=tpu-research-2026 --zone=us-central2-b \
+         --node-count=4 --node-prefix=seqax-ms4 \
+         --accelerator-type=v4-16 \
+         --runtime-version=tpu-ubuntu2204-base
+
+     SAVE EVERYTHING FIRST. See MULTISLICE_PLAN.txt section 0 - you already
+     lost the 18 GB corpus once this way. Put it in GCS before teardown.
+
+     Also: ask TRC before deleting. A grant shaped as "2 x v4-32" may not
+     convert to "8 x v4-8" automatically. Use the create-before-delete trick -
+     queued resources queue rather than hard-fail, so a request that is
+     accepted into WAITING_FOR_RESOURCES means you have a claim.
+
+4.3  The deliverable
+
+     A curve: DCN bytes per step on the x axis, step time (or MFU) on the y.
+     Points at 1, 2, 4 and 8 slices. Predicted line from section 2 overlaid on
+     measured points.
+
+     If prediction and measurement agree, you have a model that extrapolates to
+     hardware you do not have. If they disagree, the gap is the interesting
+     result - most likely explained by overlap, which the profile will show.
+
+
+-------------------------------------------------------------------------------
+5. THE RULE THIS EXPERIMENT DEMONSTRATES
+-------------------------------------------------------------------------------
+
+The hierarchy of your parallelism must match the hierarchy of your network.
+
+Concretely, for FSDP-style training:
+
+  put WEIGHT traffic on the fast link. Weight gathering happens every layer,
+  many times per step, and it is large. On 2 x v4-32 that is 3.875 GiB per chip
+  per forward pass - about 666 ms over DCN, which would consume most of your
+  step.
+
+  put GRADIENT traffic on the slow link. It happens once per step, at the end,
+  and after in-slice sharding it is small - 512 MiB per chip on the 2-slice
+  config, about 86 ms.
+
+That is an 8x difference between the right and wrong assignment of the SAME
+computation to the SAME hardware. Nothing about the model changes; only which
+axis of the mesh is mapped to which network.
+
+Corollary worth stating: DCN cost grows superlinearly as slices shrink, because
+each chip's shard grows and the ring lengthens at the same time. This sets a
+practical floor on how small a tightly-coupled block can usefully be - which is
+a hardware design input, not just a configuration choice.
+
+
+-------------------------------------------------------------------------------
+6. WHAT COULD RUIN THE MEASUREMENT
+-------------------------------------------------------------------------------
+
+- Compute-bound baseline. seqax builds a 2 GiB f32 attention-logit tensor per
+  layer and another roughly 2 GiB tensor in the loss head. If step time is
+  dominated by those, the DCN effect will be buried. Establish your
+  compute-bound baseline (arm 0) BEFORE attributing anything to the network.
+
+- Overlap. XLA may hide much of the DCN transfer behind compute, especially
+  with the async collective flags already set in init_seqax.py. That is a good
+  outcome for training and an annoying one for measurement. Report both raw
+  bytes and exposed (non-overlapped) time.
+
+- Changing two variables at once. When you shrink slices, per-chip batch and
+  in-slice sharding both change. Hold tokens-per-chip constant across arms or
+  the curve means nothing.
+
+- The TPU lock. See MULTISLICE_PLAN.txt risks. Every interrupted run leaves an
+  orphan process holding the chips and the next launch fails confusingly.
+  Clear the TPU at the top of every launch.
+
+- Re-provisioning cost. Each topology change is a full teardown, re-request,
+  re-install, re-download. Budget for it, and get the code fully general before
+  you start so each change is config-only.
+
+
+-------------------------------------------------------------------------------
+7. ORDER OF WORK
+-------------------------------------------------------------------------------
+
+ 1. finish setup on the current 2 x v4-32 (MULTISLICE_PLAN.txt section 2)
+ 2. do the section 2 arithmetic on paper - deliverable on its own
+ 3. build 3.1, the generalized ici/dcn mesh
+ 4. build 3.2, the typed all_reduce
+ 5. build 3.3, the DCN visibility report
+ 6. verify single-slice config reproduces today's behavior exactly
+ 7. run arm 0 (control), arm 1 (correct), arm 2 (wrong)
+ 8. profile arm 1, extract the overlap fraction
+ 9. upload the corpus to GCS, save everything, tear down
+10. re-provision as 4 x v4-16, rerun - config change only
+11. optionally re-provision as 8 x v4-8
+12. build the curve, compare against prediction, write it up

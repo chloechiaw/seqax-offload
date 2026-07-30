@@ -22,8 +22,14 @@ def set_variables():
             "NCCL_PROTO": "SIMPLE,LL,LL128",
         }
     )
-    os.environ["LIBTPU_INIT_ARGS"] = (
-        "--xla_tpu_enable_data_parallel_all_reduce_opt=true --xla_tpu_data_parallel_opt_different_sized_ops=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true"
+    # setdefault, not assignment: these flags control async collective fusion, which
+    # is what overlaps collectives with compute. Newer libtpu rejects the fusion flags
+    # outright on some platforms (v4/"pufferfish"), and any experiment measuring
+    # collective cost needs to set them identically across arms. Both require that an
+    # externally-supplied LIBTPU_INIT_ARGS win over this default.
+    os.environ.setdefault(
+        "LIBTPU_INIT_ARGS",
+        "--xla_tpu_enable_data_parallel_all_reduce_opt=true --xla_tpu_data_parallel_opt_different_sized_ops=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true",
     )
 
 

@@ -64,8 +64,8 @@ class TokenBatchParams:
 class TokenBatch:
     """A batch of tokens, which are typically the input to training."""
 
-    targets: u32[b"batch/d len"]
-    is_seq_start: bool_[b"batch/d len"]
+    targets: u32[b"batch/data/d len"]
+    is_seq_start: bool_[b"batch/data/d len"]
 
 
 @dataclass(frozen=True)
@@ -263,7 +263,7 @@ def _div_exact(a: int, b: int) -> int:
 
 @functools.partial(jax.jit, donate_argnums=(0,))
 @typechecked
-def _decode(encoded_tokens: u32[b"batch/d len"]) -> TokenBatch:
+def _decode(encoded_tokens: u32[b"batch/data/d len"]) -> TokenBatch:
     # encoded_tokens encoding:
     #  2*id+1 for the first token in a sequence
     #  2*id for other tokens in the sequence

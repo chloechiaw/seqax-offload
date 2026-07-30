@@ -1,0 +1,624 @@
+SWEEP ON THE HARDWARE ALREADY IN HAND - NO RE-PROVISIONING
+seqax, project tpu-research-2026
+written 2026-07-28
+
+Companion to DCN_64CHIP_PLAN.txt, not a replacement. That file plans the full
+nine-point matrix and assumes a teardown-and-re-request cycle per topology.
+This file answers a narrower question: given exactly what is ACTIVE right now,
+what is the most experiment obtainable without provisioning anything?
+
+Answer: most of it. Two arms of the matrix are already standing, they happen to
+form an exact control pair, and the ratio axis can be swept in software.
+
+Code changes still come from DCN_HOP_EXPERIMENT.txt section 3. Operational
+risks still come from MULTISLICE_PLAN.txt. Neither is restated here.
+
+
+-------------------------------------------------------------------------------
+0. WHAT IS ON THE GROUND - VERIFIED 2026-07-28
+-------------------------------------------------------------------------------
+
+  seqax-ms-qr        ACTIVE     us-central2-b     ON-DEMAND
+    seqax-ms-0       v4-32   16 chips   topology 2x2x4   4 hosts   READY
+    seqax-ms-1       v4-32   16 chips   topology 2x2x4   4 hosts   READY
+    runtime tpu-ubuntu2204-base
+    32 chips total, 2 slices, one DCN axis
+
+  probe-v6e          ACTIVE     europe-west4-a    SPOT
+    probe-v6e-0      v6e-8    8 chips   topology 2x4     1 host    HEALTHY
+    probe-v6e-1      v6e-8    8 chips   topology 2x4     1 host    HEALTHY
+    runtime v6e-ubuntu-2404
+    16 chips total, 2 slices, one DCN axis
+    requested 22:48:54Z, ACTIVE 23:13:17Z - about 24 minutes
+
+Reminder on the naming, because it bites: v4-32 counts TENSORCORES and v4 has
+two per chip, so v4-32 is 16 chips. v6e-8 counts CHIPS and v6e has one core per
+chip, so v6e-8 is 8 chips. Confirmed by topology: 2x2x4 = 16, 2x4 = 8.
+
+DCN_64CHIP_PLAN.txt section 2 says to delete probe-v6e once access is confirmed
+and request v6e-64. DO NOT DO THAT YET. Reasons in section 5.
+
+
+-------------------------------------------------------------------------------
+1. THE COINCIDENCE - THESE TWO ALLOCATIONS ARE AN EXACT CONTROL PAIR
+-------------------------------------------------------------------------------
+
+Model held fixed at the 2B config: 2^31 params, gradients in f32 are 8 GiB
+global. Weights sharded within a slice, replicated across slices, so only the
+gradient all-reduce crosses DCN.
+
+Per-chip gradient shard = 8 GiB / (chips per slice).
+Ring all-reduce over n slices moves 2(n-1)/n times the shard.
+
+  2 x v4-32   16 chips/slice   shard 512 MiB   traffic 0.537 GB   /  6.25 GB/s
+  2 x v6e-8    8 chips/slice   shard   1 GiB   traffic 1.074 GB   / 12.5  GB/s
+
+  both -> 85.9 ms
+
+The pair extends to n=4 without acquiring a single additional chip, because the
+cancellation only needs the v6e slices to hold half the chips of the v4 slices
+at equal slice count:
+
+  n=2   2 x v4-32 (16 ch/slice, 32 chips)   2 x v6e-8 (8 ch/slice, 16 chips)
+                                                                     85.9 ms
+  n=4   4 x v4-16 ( 8 ch/slice, 32 chips)   4 x v6e-4 (4 ch/slice, 16 chips)
+                                                                    257.7 ms
+
+Both rows fit inside the 32 v4 and 16 v6e chips already granted - the n=4 row is
+a re-carve, not an expansion. It stops there: n=8 would need v6e-1, one chip per
+slice, and there is nothing left to halve. So the twin ladder is exactly two
+rungs deep on this hardware, and the n=2 rung is the one already standing.
+
+Exactly equal, and not by luck in the rounding. v6e has half the chips per
+slice, so twice the shard, and twice the DCN bandwidth. The factors cancel
+identically. Half the chips against twice the bandwidth is an exact cancellation
+at any model size, because both terms are linear.
+
+DCN_64CHIP_PLAN.txt section 3 flagged a v4-32chip / v5e-64chip control pair as a
+lucky feature of the planned matrix. The same structure already exists between
+the two things currently powered on, at a quarter of the chips and zero
+provisioning.
+
+What the pair buys is a DISCRIMINATING test, which is better than a confirming
+one. Two hypotheses make opposite predictions:
+
+  H1  the penalty is set by absolute DCN time
+      -> the two arms match, because both are 85.9 ms
+
+  H2  the penalty is set by the RATIO of DCN time to compute time
+      (this is the DCN_64CHIP_PLAN section 4 hypothesis)
+      -> the two arms do NOT match, because v6e has roughly 3.3x the compute
+         per chip and therefore a much shorter step to hide 85.9 ms inside
+
+One measurement separates them. Under H2 the v6e arm should be hurt distinctly
+worse at equal tokens-per-chip, despite identical DCN time, purely because it
+finishes its compute sooner and has less to overlap against.
+
+If H2 survives here it is worth far more than surviving on nine points that all
+move byte count and bandwidth together.
+
+
+-------------------------------------------------------------------------------
+2. THE SWEEP KNOB THAT NEEDS NO RE-PROVISIONING - IT IS BATCH SIZE
+-------------------------------------------------------------------------------
+
+This is the part that changes the shape of the project, so it is worth stating
+carefully.
+
+The x axis both plans want is  r = (DCN time) / (compute time per step).
+
+  DCN time per step
+    gradient all-reduce, once per step, at the end.
+    Bytes depend on params, chips per slice, slice count, bandwidth.
+    INDEPENDENT OF BATCH SIZE.
+
+  compute time per step
+    6 x params x tokens_per_chip / achieved FLOP/s.
+    LINEAR IN BATCH SIZE.
+
+Therefore  r  is proportional to  1 / tokens_per_chip,  and batch size sweeps r
+directly on fixed hardware.
+
+Corollary worth noticing, because it prevents a wasted week: sweeping MODEL SIZE
+does not move r at all. Gradient bytes scale linearly with params and compute
+scales linearly with params, so the ratio is unchanged. The 84m/270m/540m/1b/2b
+config ladder is useless as a ratio sweep. Only tokens-per-chip moves r.
+
+Predicted numbers below. Achieved FLOP/s assumed at 40 percent of peak; peak
+values are the ones DCN_64CHIP_PLAN.txt section 4 flags as VERIFY BEFORE
+WRITEUP, and they carry that flag here too.
+
+HARD FLOOR ON B, and it bites the interesting end of the sweep. The batch is
+sharded over the chips, so global batch cannot go below one sequence per chip:
+
+  2 x v6e-8   16 chips   ->   B >= 16
+  2 x v4-32   32 chips   ->   B >= 32
+
+That removes the high-r rows outright. They are not "tight", they are not
+expressible. The reachable grids:
+
+  2 x v6e-8, 16 chips, seq len 1024, DCN 85.9 ms
+  compute time = 2.25 ms x B
+
+    B      tokens/chip   compute    r = DCN/compute
+    ---    -----------   -------    ---------------
+     16        1024        36 ms        2.39
+     32        2048        72 ms        1.19
+     64        4096       144 ms        0.60
+    128        8192       288 ms        0.30
+    256       16384       575 ms        0.15
+    512       32768      1151 ms        0.075
+
+  2 x v4-32, 32 chips, seq len 1024, DCN 85.9 ms
+  compute time = 3.75 ms x B
+
+    B      tokens/chip   compute    r = DCN/compute
+    ---    -----------   -------    ---------------
+     32        1024       120 ms        0.72
+     64        2048       240 ms        0.36
+    128        4096       480 ms        0.18
+    256        8192       960 ms        0.089
+    512       16384      1920 ms        0.045
+   1024       32768      3840 ms        0.022
+
+Overlap is r in [0.075, 0.72] - a factor of 10, four shared points, narrower
+than the 100x the unconstrained tables suggested. Still enough to test collapse,
+but it is the binding constraint on this hardware and worth knowing before the
+plots get drawn.
+
+Note which generation reaches which end. v6e has FEWER chips, so more
+tokens-per-chip at equal B, so it reaches HIGHER r. The small allocation is the
+one that probes the interesting region. This is the second reason not to trade
+the 16 v6e chips for 64: more chips pushes r DOWN, away from the knee.
+
+The knee should sit somewhere in r of 0.1 to 1. v6e covers that densely; v4
+covers only its lower half. If the knee turns out to sit above r = 2.4, neither
+allocation can reach it at seq len 1024 and the way to get there is longer
+sequences or a re-carve to more slices, not more chips.
+
+Note the two generations do NOT reach the same r at the same B, because
+tokens-per-chip differs (16 chips against 32). Compare at equal r, never at
+equal B.
+
+
+-------------------------------------------------------------------------------
+3. THE ARMS
+-------------------------------------------------------------------------------
+
+Per hardware, per batch point. Everything except slice count held fixed.
+
+  arm 0   CONTROL, one slice only, no DCN
+          v4:  seqax-ms-0 alone, ici {fsdp: 16, t: 1}, global batch B/2
+          v6e: probe-v6e-0 alone, ici {fsdp: 8, t: 1},  global batch B/2
+
+          Halving the batch holds tokens-per-chip identical to arm 1. This
+          matters more than it looks: it also holds the in-slice ICI weight
+          gathering identical, so arm1 minus arm0 isolates DCN and nothing else.
+          Weight all-gather is ALSO batch-independent, so at small B the step is
+          communication-bound whether or not DCN is involved. Without a control
+          taken at matched tokens-per-chip, that ICI effect gets misattributed
+          to DCN and the knee lands in the wrong place.
+
+  arm 1   BOTH SLICES, CORRECT HIERARCHY
+          v4:  ici {fsdp: 16, t: 1}   dcn {data: 2}    global batch B
+          v6e: ici {fsdp: 8,  t: 1}   dcn {data: 2}    global batch B
+          Predicted DCN 85.9 ms in both cases.
+
+  arm 2   BOTH SLICES, WRONG HIERARCHY - one batch point only, not swept
+          fsdp spans all chips so weight gathering crosses DCN.
+          v4:  fsdp 32 over both slices. Weight all-gather is 3.875 GiB per chip
+               per forward. Upper bound 666 ms, and it recurs per forward and
+               again in backward, against 85.9 ms for the correct arrangement.
+          v6e: fsdp 16 over both slices. 3.75 GiB per chip, upper bound 322 ms.
+
+          These are upper bounds - they charge every gathered byte at DCN rate,
+          when in reality only the inter-slice segment of the ring does. Report
+          them as bounds, not predictions. The point of the arm is the order of
+          magnitude and the fact that it is a config change, not a code change.
+
+Measure per run: step time (steady-state median, not mean, not whole-run),
+MFU, peak HBM per chip, and from the profile the exposed non-overlapped DCN
+time. Report exposed time separately from raw bytes - the difference between
+them IS the overlap result, and per section 1 it is the quantity that should
+differ between generations.
+
+These are TIMING runs. 50 steps, throw away the first 10, no convergence claim.
+Loss is irrelevant here and chasing it wastes the allocation.
+
+Run count: 7 batch points x 2 arms x 2 generations + 2 wrong-hierarchy arms
+= 30 runs. At 50 steps each these are seconds to low minutes of compute apiece.
+Process startup and TPU acquisition dominate, not the stepping.
+
+
+-------------------------------------------------------------------------------
+4. WHAT BLOCKS THIS TODAY, AND WHAT DOES NOT
+-------------------------------------------------------------------------------
+
+BLOCKED. Arm 1 and arm 2 cannot run at all right now. train.py:573 is still
+
+    Mesh(mesh_utils.create_device_mesh([config.mesh.d, config.mesh.t],
+         jax.devices()), ("d", "t"))
+
+and MeshConfig at train.py:524 is still two bare ints. That constructor assumes
+one uniform network. There is no way to express dcn {data: 2} and no multislice
+run of any kind until DCN_HOP_EXPERIMENT.txt section 3.1 exists. It is the
+critical path and nothing else in this file matters until it lands.
+
+NOT BLOCKED, START IMMEDIATELY. Arm 0 is single-slice and runs on today's code
+unmodified - mesh.d=16 on one v4 slice, mesh.d=8 on one v6e slice. That is the
+entire compute-bound baseline, at every batch point, on both generations. It is
+half the data in this plan and it needs zero new code.
+
+It is also the arm both existing docs warn is the one that makes everything else
+interpretable (DCN_HOP_EXPERIMENT section 6, DCN_64CHIP_PLAN section 9). Getting
+it done while the mesh work proceeds is free parallelism.
+
+There is a second reason to start on v6e specifically, in section 5.
+
+
+-------------------------------------------------------------------------------
+5. THE ASYMMETRY THAT SHOULD DRIVE THE ORDERING
+-------------------------------------------------------------------------------
+
+  seqax-ms    v4     ON-DEMAND    will still be there tomorrow
+  probe-v6e   v6e    SPOT         can vanish without warning, at any moment
+
+DCN_64CHIP_PLAN.txt section 8 orders the work v4-first, building code on the
+hardware in hand. That was written before the v6e probe came back. It should be
+inverted for the perishable half:
+
+  the v6e allocation is the resource that can disappear.
+  the v4 allocation is the resource that cannot.
+
+So the v6e slices should be brought to a state where they have already produced
+data, before anything else. Concretely: install the stack, smoke test, and take
+the full arm 0 batch sweep on probe-v6e-0. That is a few hours of work and it
+banks the v6e half of the compute-bound baseline permanently. If the spot
+allocation is reclaimed an hour later, the data survives; the allocation was
+going to be reclaimed eventually regardless.
+
+The mesh code work is unaffected by preemption and belongs on the v4, which is
+safe. The two proceed in parallel.
+
+AND DO NOT DELETE probe-v6e. DCN_64CHIP_PLAN section 2 says to delete the probe
+and request v6e-64. Three reasons that is now the wrong move:
+
+  a) 2 x v6e-8 is not a throwaway probe. Per section 1 it is an exact 85.9 ms
+     twin of the v4 setup, which is a better experiment than any single point
+     of the planned nine.
+  b) Deleting a spot allocation to re-request a LARGER spot allocation trades a
+     confirmed grant for an unconfirmed one. This one took 24 minutes to fill.
+     A v6e-64 request may take far longer or not fill at all, and the small one
+     will not necessarily come back.
+  c) It moves r in the WRONG DIRECTION for this measurement. More chips means
+     fewer tokens per chip at fixed batch, which pushes r down and away from the
+     knee. 2 x v6e-32 also destroys the twin outright - the shard drops to
+     256 MiB and DCN time to 21 ms, so the exact cancellation with the v4 is
+     gone.
+
+     What v6e-64 DOES buy, and this is real: MULTI-HOP. A genuine two-level DCN
+     hierarchy, dcn {a: 2, b: 2}, needs 4 or more slices at a slice size that
+     still has internal topology. v6e-4 exists in the zone, so 4 slices is
+     reachable at 16 chips, but 4 chips per slice has essentially no topology
+     left. Real 4- and 8-slice hierarchy needs the 64. That is a separate
+     experiment from the ratio sweep and it is not redundant with anything in
+     section 2 - it is the one thing here that more chips genuinely unlocks.
+
+     So the ordering is: run the ratio sweep on 16 chips, and request v6e-64
+     when the multi-hop question comes up. Not before, and never by tearing
+     down a filled grant to get an unfilled one.
+
+If a bigger v6e shape is wanted later, request it ALONGSIDE and only tear down
+the small one after the big one reaches ACTIVE. Queued resources queue rather
+than hard-fail, so a create-before-delete costs nothing but concurrent spend.
+
+Both allocations bill while idle. Neither should sit ACTIVE and unused for days.
+
+
+-------------------------------------------------------------------------------
+6. THE SOFTWARE FORK - THIS WILL COST A DAY IF NOT PLANNED FOR
+-------------------------------------------------------------------------------
+
+The v4 baseline is pinned to jax 0.4.35, which is from October 2024. v6e support
+in that version is doubtful at best, and probe-v6e is on the bare
+v6e-ubuntu-2404 image with nothing installed. Expect jax 0.4.35 to fail to see
+the v6e chips.
+
+The tempting fix - newer jax on v6e, keep 0.4.35 on v4 - INVALIDATES THE
+CROSS-GENERATION COMPARISON. Different XLA versions mean different collective
+scheduling, different overlap behavior, different fusion. That is precisely the
+quantity being measured in section 1. Two arms on two compilers are not
+comparable and the whole discriminating test evaporates.
+
+Do this instead:
+
+  1. find the oldest jax that works on v6e
+  2. verify it also works on v4
+  3. re-run the existing v4 baseline on it and confirm step time is unchanged
+  4. pin THAT version everywhere, including the already-collected v4 numbers
+
+Step 3 is the one that will be skipped under time pressure and is the one that
+protects every comparison in this document. If step time on v4 does shift
+between versions, that is itself worth recording, and every pre-existing v4
+number has to be retaken.
+
+create_hybrid_device_mesh is verified present in 0.4.35 per DCN_HOP_EXPERIMENT
+section 3.1; confirm it is still present and unchanged in whatever version wins.
+
+TWO CODE GAPS FOUND WHILE CHECKING THIS, both small, both silent if missed:
+
+  training_io.py:267  get_flops_per_device() HAS NO v6e BRANCH. It tests for
+  A100, TPU v4, v5 lite/v5e, v5, v3, then falls through to an else that prints
+  "Unrecognized device, assuming ridiculously low 1 MFLOPS" and returns 1e6.
+  It does not crash. Every MFU number on v6e will be wrong by roughly eight
+  orders of magnitude, and slicemon_hook.py:250 consumes the same value, so the
+  dashboard will agree with the wrong number. One-line fix: add a branch for
+  device_kind starting "TPU v6" returning 918e12, after confirming both the
+  exact device_kind string and the peak figure on the machine.
+
+  train.py:714-729  jax.distributed.initialize() is only called on the ClearML
+  queue path. With training.queue unset, logger is None and main_contained runs
+  with no distributed init at all. Fine for a single-host job, broken for any
+  multi-host one. This does not block arm 0 on v6e - v6e-8 is ONE host with 8
+  chips, so a single process sees the whole slice - but it does block arm 0 on
+  v4, where a 16-chip slice is 4 hosts. Another reason the v6e is where to
+  start: it is the only arm in this plan that needs neither the mesh work nor
+  the distributed-init work.
+
+
+-------------------------------------------------------------------------------
+7. WHAT COULD RUIN THIS MEASUREMENT
+-------------------------------------------------------------------------------
+
+Everything in DCN_HOP_EXPERIMENT.txt section 6 applies. New or sharpened here:
+
+- HBM ceiling on the batch sweep. The top batch points may not fit. seqax builds
+  a large f32 attention-logit tensor per layer, and it scales with per-chip
+  batch. Find the ceiling empirically per generation FIRST, then pick the seven
+  batch points below it. Do not plan a sweep to B=512 and discover at B=128 that
+  it OOMs, because the arm 0 and arm 1 batch grids have to match.
+
+- The two generations have different chip counts, so equal B is NOT equal
+  tokens-per-chip. Plot against r, never against B. This is the easiest way to
+  produce a wrong curve that looks fine.
+
+- Small-batch end is not purely a DCN story. ICI weight gathering is also
+  batch-independent, so as B shrinks BOTH networks become the bottleneck
+  together. Only the arm1-minus-arm0 difference is interpretable there. Do not
+  read absolute MFU at B=8 as a DCN result.
+
+- Spot preemption mid-sweep leaves a partial batch grid. Write each point to
+  durable storage as it completes, not at the end of the sweep. A preemption
+  should cost one point, not the run.
+
+- Cross-zone is not joinable. us-central2-b and europe-west4-a cannot form one
+  job, and nothing in this plan asks them to. The two generations are two
+  independent experiments compared after the fact, which is exactly why the
+  jax-version pinning in section 6 carries the weight it does.
+
+- The TPU lock. Every interrupted run leaves an orphan process holding chips and
+  the next launch fails confusingly. A 30-run sweep is 30 chances to hit this.
+  Clear the TPU at the top of every launch, without exception.
+
+
+-------------------------------------------------------------------------------
+8. ORDER OF WORK
+-------------------------------------------------------------------------------
+
+ 1. resolve the jax version fork per section 6, on the v6e, first
+ 2. install stack on both probe-v6e workers, smoke run single slice
+ 3. find the HBM batch ceiling on v6e, fix the seven batch points
+ 4. run arm 0 sweep on probe-v6e-0 - banks the perishable half
+ 5. IN PARALLEL on the v4: build DCN_HOP_EXPERIMENT 3.1, generalized ici/dcn
+    mesh, and verify a dcn-size-1 config reproduces today's behavior exactly
+ 6. re-run v4 baseline on the pinned jax, confirm no step-time shift
+ 7. arm 0 sweep on seqax-ms-0
+ 8. build 3.2 typed all_reduce and 3.3 DCN visibility report
+ 9. arm 1 sweep on both generations
+10. arm 2 once per generation, one batch point, record and move on
+11. plot penalty against r; check the two generations overlap through
+    r in [0.075, 2.9]
+12. only then decide whether a larger v6e shape adds anything section 2 has not
+    already reached in software
+
+Steps 1 through 4 need no new code and should start now. Step 5 is the critical
+path for everything from step 9 on.
+
+
+-------------------------------------------------------------------------------
+9. RELATIONSHIP TO THE OTHER PLANS
+-------------------------------------------------------------------------------
+
+  MULTISLICE_PLAN.txt        setup, launch mechanics, operational risks. Current.
+  DCN_HOP_EXPERIMENT.txt     section 3 code changes. Current and blocking.
+                             Sections 1-4 superseded by DCN_64CHIP_PLAN.
+  DCN_64CHIP_PLAN.txt        the full nine-point matrix. Still the destination.
+                             Section 2 probe: DONE, access confirmed.
+                             Section 8 ordering: revised by section 5 here.
+  INHAND_SWEEP_PLAN.txt      this file. What runs before any re-provisioning.
+
+The claim being tested is unchanged from DCN_64CHIP_PLAN section 4. What changes
+is the cost of testing it: the ratio axis turns out to be reachable with batch
+size on fixed hardware, and the hardware currently powered on already contains a
+control pair. The nine-point matrix becomes a way to EXTEND the curve rather
+than the only way to obtain one.
+
+
+-------------------------------------------------------------------------------
+10. FIELD NOTES - BRINGING UP probe-v6e-0, ALL VERIFIED ON THE MACHINE
+-------------------------------------------------------------------------------
+
+Working state reached 2026-07-28. jax 0.11.0, jaxlib 0.11.0, libtpu 0.0.44.1,
+8 devices visible, backend init 25 s.
+
+10.1  MEGASCALE_NUM_SLICES=1 IS REQUIRED FOR EVERY SINGLE-SLICE RUN
+
+      This is the one that costs hours if not known. Because the queued resource
+      was created with --node-count=2, GCP stamps BOTH nodes with multislice
+      metadata in tpu-env:
+
+        MEGASCALE_COORDINATOR_ADDRESS: '10.164.0.3:8080'
+        MEGASCALE_NUM_SLICES: '2'
+        MEGASCALE_SLICE_ID: '0'
+
+      libtpu reads this and blocks in the Megascale handshake waiting for the
+      other slice. It does not time out and it does not error. The symptom is a
+      process that opens all 8 /dev/vfio handles, grows to ~40 GB RSS, and then
+      sits there. jax prints "TPU backend initialization is taking more than
+      60.0 seconds. Did you run your code on all TPU hosts?" - which reads like
+      generic boilerplate and is in fact exactly right.
+
+        MEGASCALE_NUM_SLICES=1 python -m train ...        # arm 0
+        (leave unset / =2 for arm 1, both slices launched together)
+
+      Consequence worth having: the multislice plumbing is ALREADY WIRED. The
+      coordinator address is populated, slice ids are assigned. Arm 1 does not
+      need any of that built - only the mesh code from DCN_HOP_EXPERIMENT 3.1.
+
+10.2  device_kind IS 'TPU v6 lite', NOT 'TPU v6e'
+
+      Confirmed on the machine. The section 6 patch to
+      training_io.py:get_flops_per_device must therefore test
+      device.startswith("TPU v6") - verified to match. Do NOT test for "v6e",
+      it will silently fall through to the 1 MFLOPS branch.
+
+10.3  create_hybrid_device_mesh SURVIVES THE VERSION JUMP
+
+      Present in jax 0.11.0 with signature
+        (mesh_shape, dcn_mesh_shape, devices=None, *, process_is_granule=False,
+         should_sort_granules_by_key=True, allow_split_physical_axes=False)
+      which is what 3.1 needs. The mesh rewrite is not at risk from the jax bump.
+
+10.4  THE IMAGE IS UBUNTU 24.04 - PEP 668 BLOCKS SYSTEM pip
+
+      v6e-ubuntu-2404 is Python 3.12 with an externally-managed environment.
+      The v4 workflow of pip-installing system-wide does not carry over.
+
+        sudo apt-get update -qq && sudo apt-get install -y python3.12-venv
+        python3 -m venv ~/seqax-venv
+
+      The package is python3.12-venv specifically; python3-venv alone does not
+      resolve without an apt update first. All later commands need the explicit
+      ~/seqax-venv/bin/ prefix - a non-interactive ssh --command does not source
+      any profile, so nothing is on PATH.
+
+10.5  TRANSPARENT HUGEPAGES
+
+        sudo sh -c 'echo always > /sys/kernel/mm/transparent_hugepage/enabled'
+
+      Not the cause of the hang in 10.1, but jax warns that startup and shutdown
+      are significantly slower without it on v5e and newer. Does not survive a
+      reboot and must be set before the TPU process starts. Put it next to the
+      TPU-lock clearing at the top of every launch.
+
+10.6  NEVER PUT pkill IN THE SAME ssh --command AS THE THING IT KILLS
+
+      Cost two rounds of confusing SSH 255 loops. gcloud runs the payload as
+      bash -c "<entire script>", so the script text is in that process's own
+      command line. pkill -f matches full command lines. Any pkill -f pattern
+      that appears anywhere else in the same script kills its own shell, SSH
+      exits 255, and gcloud retries - which self-destructs identically each
+      time, so it looks like a connectivity problem.
+
+      The [s]eqax bracket trick is NOT sufficient: it only helps if the plain
+      string appears nowhere else in the script, and a later
+      ~/seqax-venv/bin/python invocation reintroduces it.
+
+      Rule: process cleanup goes in its own separate ssh call. Always.
+
+      Note this is a DIFFERENT failure from the SSH 255 in MULTISLICE_PLAN.txt
+      risks, which is transient contention from concurrent --worker=all. Same
+      exit code, unrelated cause. This one is 100 percent reproducible.
+
+10.7  THE PIN IS jax 0.4.35 ON BOTH GENERATIONS - RESOLVED, NO PORT NEEDED
+
+      Verified on the machines: jax 0.4.35 reports "8 TPU v6 lite" on
+      probe-v6e-0 and drives all 16 chips across 4 hosts on seqax-ms-0. It is
+      also the version the existing v4 baseline already used, so section 6's
+      "re-run the v4 baseline on the new pin" step is moot. Pin 0.4.35.
+
+      The detour that produced this answer is worth recording, because the
+      obvious move is wrong. `pip install -U jax[tpu]` takes 0.11.0, which
+      requires Python >=3.12 (v4's image is 3.10) and, more importantly, does
+      not run seqax at all on EITHER generation: shardlib reaches into private
+      jax internals that modern jax restructured -
+
+        shardtypes.py:171,213,412  jax._src.core.thread_local_state.trace_state
+        shardtypes.py:366,390      jax._src.mesh.thread_resources
+        shardops.py:264            jax._src.sharding_impls.TransferToMemoryKind
+
+      That is a seqax-vs-jax-version problem, NOT a v4-vs-v6e problem, and it is
+      the thing that makes "just use the newest jax" expensive. Six call sites,
+      all load-bearing for shardlib's sharding checks. Port them only if some
+      future requirement forces a newer jax; nothing in this plan does.
+
+10.8  SEQAX MEASURED ON v4 UNDER THE PIN - FIRST REAL NUMBER
+
+      seqax-ms-0, one slice, 16 chips, 2B config, batch 64, seq len 1024,
+      4096 tokens/chip, jax 0.4.35:
+
+        async collective fusion ON    556 ms/step   34.50 percent MFU
+        async collective fusion OFF   561 ms/step   34.21 percent MFU
+        peak HBM 1.528 GiB/device, true peak 7.964 GiB of 30.75
+
+      The fusion flags make no measurable difference, which is the expected
+      null result for a single slice with no DCN traffic to overlap. Worth
+      having on record BEFORE arm 1, because if they matter there, that
+      difference is attributable to DCN and nothing else.
+
+      Achieved 94.9 TFLOP/s per chip against 275e12 peak. Section 2's tables
+      assumed 40 percent MFU; 34.5 is the measured figure and the predicted
+      compute times there should be scaled by 40/34.5 = 1.16x accordingly.
+
+10.9  FIVE SEQAX BUGS FOUND BRINGING THIS UP - ALL PATCHED EXCEPT THE LAST
+
+      a) init_seqax.py applied GPU-only XLA flags on TPU, aborting before jax
+         finished importing. docs/offload_phase0.md records the identical bug
+         for CPU; the gate excluded CPU but not TPU. Now excludes both.
+
+      b) training_io.py imported jax.lib.xla_client at module scope. Only
+         save_hlo_svg needs it and that is not on the training path. Now
+         optional.
+
+      c) init_seqax.py ASSIGNED LIBTPU_INIT_ARGS rather than defaulting it.
+         Newer libtpu rejects its async-collective-fusion flags outright on v4
+         ("platform pufferfish"), and any experiment measuring collective cost
+         must set them identically across arms. Now setdefault, so
+         LIBTPU_INIT_ARGS from the environment wins.
+
+      d) shardtypes.py used jax.tree_map, removed in modern jax. Now
+         jax.tree_util.tree_map, which works on 0.4.35 and later alike.
+
+      e) NOT FIXED - the built-in profiler kills every multi-host run. At step
+         start+1 process 0 calls start_profile, and at start+2 it spends ~31 s
+         writing perfetto traces while the other three hosts sit in collectives.
+         The slice then aborts with "The program continuator has halted
+         unexpectedly". The MFU line prints just before the abort, which is the
+         only reason 10.8 has numbers at all. Any run longer than 3 steps dies
+         here. Gate the start_profile/stop_profile calls behind a flag while
+         KEEPING the time.time() measurement around them - the timing is what
+         10.8 reads, the trace dump is what kills it.
+
+10.10 THE SHIPPED SYNTHETIC DATASET IS FAR TOO SMALL
+
+      synthetic_dataset.zarr holds about 256 sequences - step_count is
+      seq_count // batch, so 4 steps at batch 64. Regenerate:
+
+        cd ~/seqax-offload/tools && python3 write_synthetic_dataset.py \
+          --config-name=synthetic_dataset examples=65536 \
+          +output=$HOME/seqax-offload/synthetic_big.zarr
+
+      39 MB, gives 65536//batch steps - 1024 at batch 64, 128 at batch 512.
+      Then run with sequences_per_read_block=256 (not 16): the shuffle buffer
+      is read_blocks_per_shuffle_buffer x sequences_per_read_block and must
+      exceed the batch, so 8 x 16 = 128 starves any batch above 128.
+
+      Two traps in the generator itself. It annotates shapes with BYTES
+      literals, b"batch seqlen", which current jaxtyping rejects; and it needs
+      jaxtyping==0.2.34, which declares typeguard==2.13.3 while shardlib needs
+      the typeguard 4.1.5 API. Generate the data first, then reinstall
+      typeguard==4.1.5 before training. Order matters; the pip warning about
+      the conflict is expected and can be ignored.
+
+      Generate on EVERY host - each process reads the file locally. Same seed
+      gives identical data, so per-host generation is safe.

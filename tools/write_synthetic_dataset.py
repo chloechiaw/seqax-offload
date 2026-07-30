@@ -36,13 +36,13 @@ class Config:
 
 
 @jaxtyped(typechecker=typechecker)
-def copy(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.ndarray, b"batch seqlen"]:
+def copy(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.ndarray, "batch seqlen"]:
     seq = gen.integers(1, 11, (examples, (seq_len + 1) // 2), dtype=np.uint32)
     return np.append(seq, seq, axis=1)[:, :seq_len]
 
 
 @jaxtyped(typechecker=typechecker)
-def reverse(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.ndarray, b"batch seqlen"]:
+def reverse(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.ndarray, "batch seqlen"]:
     seq = gen.integers(1, 11, (examples, (seq_len + 1) // 2), dtype=np.uint32)
     return np.append(seq, np.flip(seq, axis=1), axis=1)[:, :seq_len]
 
@@ -50,7 +50,7 @@ def reverse(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.
 @jaxtyped(typechecker=typechecker)
 def random_known_distance_copy(
     seq_len: int, examples: int, gen: np.random.Generator
-) -> UInt32[np.ndarray, b"batch seqlen"]:
+) -> UInt32[np.ndarray, "batch seqlen"]:
     distance = gen.integers(max(1, seq_len // 4), seq_len, (examples,), dtype=np.uint32)
     seq = gen.integers(1, 11, (examples, seq_len), dtype=np.uint32)
     indices = np.arange(seq_len - 1)[np.newaxis, :] % distance[:, np.newaxis]
@@ -62,12 +62,12 @@ def random_known_distance_copy(
 @jaxtyped(typechecker=typechecker)
 def random_unknown_distance_copy(
     seq_len: int, examples: int, gen: np.random.Generator
-) -> UInt32[np.ndarray, b"batch seqlen"]:
+) -> UInt32[np.ndarray, "batch seqlen"]:
     return random_known_distance_copy(seq_len + 1, examples, gen)[:, 1:]
 
 
 @jaxtyped(typechecker=typechecker)
-def mixture_of_gaussians(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.ndarray, b"batch seqlen"]:
+def mixture_of_gaussians(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.ndarray, "batch seqlen"]:
     centers = gen.uniform(0, 100, (examples, 3)).astype(np.float32)
     stddevs = gen.uniform(1, 4, (examples, 3)).astype(np.float32)
     sample_cluster_ids = gen.integers(0, 3, (examples, seq_len), dtype=np.uint32)

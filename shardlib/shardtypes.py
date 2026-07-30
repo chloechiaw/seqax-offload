@@ -370,7 +370,7 @@ def make_shardings(cls, memory_kind=None):
             return jax.sharding.NamedSharding(mesh, spec)
         return jax.sharding.NamedSharding(mesh, spec, memory_kind=memory_kind)
 
-    return jax.tree_map(_sharding, make_partition_specs(cls))
+    return jax.tree_util.tree_map(_sharding, make_partition_specs(cls))
 
 
 def typed_shard_map(f, **kwargs):
@@ -397,8 +397,199 @@ def typed_shard_map(f, **kwargs):
     return wrapped
 
 
+#### Which mesh axes are carried by the slow network
+#
+# seqax's thesis is that all inter-chip communication should be explicit in the source. On a
+# single slice that is enough, because every axis costs the same. Across slices it is not:
+# an axis carried by DCN is roughly an order of magnitude slower per byte than one carried by
+# ICI, so `A/d -> A` and `A/data -> A` are the same notation for operations whose costs differ
+# by that factor.
+#
+# So the mesh declares which of its axes are DCN, and the collectives in shardops report what
+# they push across those axes. The result is a trace-time answer to "which of my collectives
+# touch the slow network, and how many bytes", which is otherwise only visible in a profile
+# after a run has already cost you the time.
+
+_DCN_AXES: frozenset = frozenset()
+_REPLICA_AXES: frozenset = frozenset()
+_AXIS_SIZES: dict = {}
+_DCN_LOG: dict = {}
+_DCN_STRICT: frozenset = frozenset()
+
+
+@dataclass(frozen=True)
+class DcnCollective:
+    """One collective, at one source location, that crosses DCN."""
+
+    site: str  # "file.py:123"
+    op: str  # "all_gather" | "psum_scatter" | "all_reduce" | "all_to_all"
+    axes: tuple  # the DCN axis names it travels over
+    bytes_per_chip: int  # bytes this chip pushes across DCN, per call
+
+
+def declare_mesh(mesh, dcn_axes: Sequence[str] = (), replica_axes: Sequence[str] = ()):
+    """Record the mesh's axis sizes and the role of each axis. Call once, at mesh construction.
+
+    Two independent properties, easy to conflate:
+
+      dcn_axes      carried by the slow network. Determines what gets ACCOUNTED as DCN
+                    traffic. Empty means a single slice, which makes the accounting inert.
+
+      replica_axes  weights are replicated over these rather than sharded. Determines what
+                    counts as "fully sharded" for the optimizer's assertion.
+
+    They usually name the same axis -- `data` is both replicated-over and DCN-carried in the
+    two-slice config -- but not always. On a single slice `data` still exists with size 1 and
+    is still a replica axis, while nothing is DCN.
+    """
+    global _DCN_AXES, _REPLICA_AXES, _AXIS_SIZES
+    _AXIS_SIZES = {name: size for name, size in zip(mesh.axis_names, mesh.devices.shape)}
+    for label, names in (("dcn_axes", dcn_axes), ("replica_axes", replica_axes)):
+        unknown = [a for a in names if a not in _AXIS_SIZES]
+        if unknown:
+            raise ValueError(f"{label} {unknown} are not axes of the mesh {tuple(_AXIS_SIZES)}")
+    _DCN_AXES = frozenset(dcn_axes)
+    _REPLICA_AXES = frozenset(replica_axes)
+    reset_dcn_log()
+
+
+def dcn_axes() -> frozenset:
+    return _DCN_AXES
+
+
+def axis_sizes() -> dict:
+    return dict(_AXIS_SIZES)
+
+
+def all_axes() -> tuple:
+    """Every mesh axis, ICI and DCN alike.
+
+    Use this wherever a reduction is meant to be global -- loss, token counts, gradient norm.
+    Hardcoding ("d", "t") was correct while those were the only axes; once a DCN axis exists,
+    the same code silently reduces over one slice only and reports per-slice numbers as if
+    they were global.
+    """
+    return tuple(_AXIS_SIZES)
+
+
+def set_dcn_allowlist(sites: Sequence[str] = ()):
+    """Only these source sites may cross DCN; any other DCN collective raises at trace time.
+
+    A misconfigured mesh -- weight gathering landing on DCN instead of gradient reduction --
+    costs an order of magnitude in step time and otherwise shows up only as "training is slow".
+    This turns it into a startup failure. Sites are matched as suffixes, e.g. "train.py:326".
+    """
+    global _DCN_STRICT
+    _DCN_STRICT = frozenset(sites)
+
+
+def reset_dcn_log():
+    _DCN_LOG.clear()
+
+
+def _caller_site() -> str:
+    """Nearest stack frame outside shardlib, as file:line."""
+    import os as _os
+    import traceback as _tb
+
+    for frame in reversed(_tb.extract_stack()[:-1]):
+        if _os.sep + "shardlib" + _os.sep not in frame.filename:
+            return f"{_os.path.basename(frame.filename)}:{frame.lineno}"
+    return "<unknown>"
+
+
+# Per-chip bytes moved by a ring collective over `n` participants, as a multiple of the
+# per-chip tensor size going in. These are the standard ring costs, and they are the same
+# formulas the experiment plan does by hand.
+_RING_COST = {
+    "all_gather": lambda n: n - 1,  # receives the other n-1 shards
+    "psum_scatter": lambda n: (n - 1) / n,  # reduce-scatter
+    "all_to_all": lambda n: (n - 1) / n,
+    "all_reduce": lambda n: 2 * (n - 1) / n,  # reduce-scatter + all-gather
+}
+
+
+def record_collective(op: str, axes: Sequence[str], x):
+    """Note that `op` travels over `axes`. No-op unless some axis is DCN.
+
+    Called from shardops for every collective. Runs at trace time, so it costs nothing at
+    runtime and reports before a single step has executed.
+    """
+    record_collective_bytes(op, axes, x.size * jnp.dtype(x.dtype).itemsize)
+
+
+def record_collective_bytes(op: str, axes: Sequence[str], local_bytes: int):
+    """As record_collective, but for callers that already know the per-chip byte count.
+
+    Used for whole-pytree collectives, where one logical synchronization covers hundreds of
+    arrays and should appear as a single row totalling them rather than hundreds of rows at
+    the same source line.
+    """
+    if not _DCN_AXES:
+        return
+    crossing = tuple(a for a in axes if a in _DCN_AXES)
+    if not crossing:
+        return
+
+    site = _caller_site()
+    if _DCN_STRICT and not any(site.endswith(s) for s in _DCN_STRICT):
+        raise TypeCheckError(
+            f"{site}: {op} crosses DCN over {crossing}, which is not in the DCN allowlist. "
+            f"Either this collective belongs on ICI (check the mesh hierarchy) or add it to "
+            f"set_dcn_allowlist()."
+        )
+
+    n = 1
+    for a in crossing:
+        n *= _AXIS_SIZES.get(a, 1)
+    if n <= 1:
+        return
+    moved = int(local_bytes * _RING_COST[op](n))
+
+    key = (site, op, crossing)
+    prev = _DCN_LOG.get(key)
+    # Re-tracing the same function must not double-count, but a genuinely bigger tensor at the
+    # same site (a different batch size, say) should win.
+    if prev is None or moved > prev.bytes_per_chip:
+        _DCN_LOG[key] = DcnCollective(site=site, op=op, axes=crossing, bytes_per_chip=moved)
+
+
+def dcn_collectives() -> list:
+    return sorted(_DCN_LOG.values(), key=lambda c: -c.bytes_per_chip)
+
+
+def dcn_report(bandwidth_gbytes_per_sec: float = None) -> str:
+    """Human-readable table of what crosses DCN per chip per step."""
+    rows = dcn_collectives()
+    if not _DCN_AXES:
+        return "COLLECTIVES CROSSING DCN: none (single-slice mesh, no DCN axes declared)"
+    lines = [f"COLLECTIVES CROSSING DCN (per chip, per step) over axes {sorted(_DCN_AXES)}"]
+    if not rows:
+        lines.append("  none -- no collective travels over a DCN axis")
+        return "\n".join(lines)
+    mib = 1024 * 1024
+    for c in rows:
+        lines.append(f"  {c.site:<22} {c.op:<13} over {','.join(c.axes):<10} {c.bytes_per_chip / mib:10.1f} MiB")
+    total = sum(c.bytes_per_chip for c in rows)
+    lines.append(f"  {'-' * 62}")
+    lines.append(f"  {'total':<22} {'':<13} {'':<15} {total / mib:10.1f} MiB")
+    if bandwidth_gbytes_per_sec:
+        secs = total / (bandwidth_gbytes_per_sec * 1e9)
+        lines.append(f"  predicted DCN time at {bandwidth_gbytes_per_sec:g} GB/s: {secs * 1e3:.0f} ms")
+    return "\n".join(lines)
+
+
 def is_fully_sharded(spec: jax.sharding.PartitionSpec):
-    """Returns True if the spec is fully sharded, i.e. every device axis is used in the partition spec."""
+    """True if `spec` is split over every axis weights are meant to be split over.
+
+    DCN axes are excluded from the requirement. Weights are deliberately REPLICATED across
+    slices rather than sharded over them -- gathering weights over DCN is the misconfiguration
+    this whole hierarchy exists to avoid -- so a weight that names every ICI axis and no DCN
+    axis is exactly right, and must not trip the "fully sharded" assertion in the optimizer.
+
+    Reads the mesh from the registry rather than jax's internal trace state, which also means
+    this no longer depends on a private jax API.
+    """
     axis_count = 0
     for axis in spec:
         if axis is None:
@@ -409,4 +600,4 @@ def is_fully_sharded(spec: jax.sharding.PartitionSpec):
             axis_count += len(axis)
         else:
             raise ValueError(f"Unknown axis type {axis}")
-    return axis_count == len(jax._src.core.thread_local_state.trace_state.axis_env)
+    return axis_count == len(_AXIS_SIZES) - len(_REPLICA_AXES)

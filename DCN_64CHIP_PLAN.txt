@@ -1,0 +1,351 @@
+SCALE-OUT INTERCONNECT EXPERIMENT - 64 CHIP VERSION
+seqax on TPU v6e / v5e / v4, project tpu-research-2026
+written 2026-07-28
+
+Supersedes DCN_HOP_EXPERIMENT.txt sections 1-4. The code changes in that file
+(section 3) and the operational risks in MULTISLICE_PLAN.txt still apply
+unchanged.
+
+
+-------------------------------------------------------------------------------
+0. WHAT CHANGED AND WHY
+-------------------------------------------------------------------------------
+
+Previously: 32 v4 chips, one interconnect speed, carvings down to 4 chips per
+slice. The worry was that 32 chips is too small and a 4-chip slice is barely a
+topology.
+
+Now: the fleet has three TPU generations with THREE DIFFERENT DCN BANDWIDTHS.
+That is the real upgrade - bigger than just having more chips.
+
+  generation   allocation                        DCN per chip
+  ----------   -------------------------------   ------------
+  v5e          64 spot, us-central1-a            3.125 GB/s
+  v5e          64 spot, europe-west4-b           3.125 GB/s
+  v4           32 on-demand, us-central2-b       6.25  GB/s
+  v4           32 spot, us-central2-b            6.25  GB/s
+  v6e          64 spot, europe-west4-a           12.5  GB/s
+  v6e          64 spot, us-east1-d               12.5  GB/s
+
+A 4x spread in scale-out bandwidth on hardware already granted. Previously the
+only way to vary the network was to change how many BYTES cross it. Now the
+BANDWIDTH itself can be varied directly, holding model and parallelism fixed.
+
+That turns a one-dimensional sweep into a two-dimensional one, and enables a
+much sharper claim. See section 4.
+
+
+-------------------------------------------------------------------------------
+1. WHAT IS ACTUALLY JOINABLE - READ THIS FIRST
+-------------------------------------------------------------------------------
+
+Google's Multislice docs are explicit: a Multislice workload can only run
+across slices that share the SAME TPU TYPE, SIZE, AND TOPOLOGY. Queued
+resources are also created per-zone; there is no cross-zone --node-count.
+
+Therefore:
+
+  CANNOT   mix v4 + v5e + v6e in one training job
+  CANNOT   join europe-west4-a to us-east1-d in one job
+  CANNOT   join slices of different sizes
+  CAN      run 2, 4 or 8 slices of the SAME type in ONE zone
+
+The fleet is not one 320-chip machine. It is five separate machines, each
+independently capable of multislice.
+
+This also means the "chips here and chips there across the world" framing is a
+DIFFERENT PROJECT. Cross-continent round trip is on the order of 100 ms, so
+synchronous per-step training is not viable there at all; it needs a
+low-communication algorithm (train locally for H steps, sync infrequently),
+which is an outer-optimizer change to the training loop, not a mesh config.
+That is real research but it is a rewrite. Not this project. Noted here so the
+scope stays honest when presenting.
+
+Zones that have BOTH generations (useful - lets the bandwidth comparison happen
+without moving zones):
+  europe-west4-a   v6e-8/16/32/64  and  v5litepod-8/16/32/64
+  us-central1-a    v6e-8/16/32/64  and  v5litepod-8/16/32/64
+
+Accelerator type names, verified present in those zones:
+  v6e-8, v6e-16, v6e-32, v6e-64            (name is the chip count)
+  v5litepod-8, v5litepod-16, v5litepod-32, v5litepod-64
+
+
+-------------------------------------------------------------------------------
+2. ACCESS - HOW TO FIND OUT, BECAUSE QUOTA WILL NOT TELL YOU
+-------------------------------------------------------------------------------
+
+Checked the standard quota API. It reports:
+
+  europe-west4    PREEMPTIBLE_TPU_LITE_PODSLICE_V5   limit 16
+  us-central1     PREEMPTIBLE_TPU_LITE_PODSLICE_V5   limit 16
+  us-east1        no TPU quota rows at all
+  v6e             no quota rows anywhere
+
+None of that matches the stated grants. But the same thing was true of the v4:
+the working v4-64 never appeared in us-central2 regional quota either. TRC
+grants do not surface through the standard quota metrics.
+
+CONCLUSION: quota cannot answer "do I have access." The only reliable test is
+to create a queued resource and see whether it is accepted.
+
+This is a SAFE probe. Queued resources QUEUE rather than hard-fail:
+
+  accepted, state WAITING_FOR_RESOURCES  -> the grant covers it, you have a
+                                            claim in line
+  rejected immediately                   -> the grant does not cover this
+                                            shape; email TRC
+
+Probe with the SMALLEST useful shape first so a mistake is cheap. Do NOT tear
+down the working v4 setup to test this - v4 on-demand and v6e spot are separate
+grants and should not conflict.
+
+  gcloud compute tpus queued-resources create probe-v6e \
+    --project=tpu-research-2026 \
+    --zone=europe-west4-a \
+    --node-count=2 \
+    --node-prefix=probe-v6e \
+    --accelerator-type=v6e-8 \
+    --runtime-version=v2-alpha-tpuv6e \
+    --spot
+
+  gcloud compute tpus queued-resources describe probe-v6e \
+    --zone=europe-west4-a --format="value(state.state)"
+
+If that reaches WAITING_FOR_RESOURCES or PROVISIONING, access is real. Delete
+the probe and request the real shape:
+
+  gcloud compute tpus queued-resources delete probe-v6e \
+    --zone=europe-west4-a --force
+
+RUNTIME VERSION - VERIFIED, europe-west4-a offers:
+
+  for v6e     v6e-ubuntu-2404      <- use this, bare image, matches the v4
+                                      workflow of installing jax yourself
+              v2-alpha-tpuv6e      <- alternative, alpha family
+
+  for v5e     v2-alpha-tpuv5-lite
+              tpu-ubuntu2204-base  <- the generic base, what the v4 used
+
+Do NOT pass the literal string RUNTIME. Full list any time with:
+
+  gcloud compute tpus tpu-vm versions list --zone=europe-west4-a
+
+JAX VERSION WARNING: the plan elsewhere says stay on jax 0.4.35 to match the v4
+baseline. That may not hold on v6e - 0.4.35 is from October 2024 and v6e
+support may need a newer jax/libtpu. If jax cannot see the chips on v6e, bump
+jax before assuming the allocation is broken. This is a real fork in the "keep
+the version pinned" strategy and it is better to hit it during the probe than
+during the sweep.
+
+NOTE ON --spot: these grants are spot/preemptible. The flag is required or the
+request will be evaluated against on-demand quota you do not have.
+
+
+-------------------------------------------------------------------------------
+3. THE EXPERIMENT MATRIX
+-------------------------------------------------------------------------------
+
+Model held fixed: the existing 2B config. 2^31 params exactly. Gradients in f32
+are 8 GiB global.
+
+Arrangement held fixed: shard weights over the chips WITHIN a slice (fast
+link), replicate across slices, so only the gradient all-reduce crosses DCN.
+Never let weight gathering cross DCN - see section 6.
+
+Ring all-reduce over n slices moves 2(n-1)/n times the per-chip shard.
+Per-chip shard = 8 GiB / (chips per slice).
+
+  v6e-64, 12.5 GB/s
+    2 x v6e-32   shard 256 MiB   traffic 0.268 GB   ->   21 ms
+    4 x v6e-16   shard 512 MiB   traffic 0.805 GB   ->   64 ms
+    8 x v6e-8    shard   1 GiB   traffic 1.879 GB   ->  150 ms
+
+  v5litepod-64, 3.125 GB/s
+    2 x v5litepod-32   shard 256 MiB   traffic 0.268 GB   ->   86 ms
+    4 x v5litepod-16   shard 512 MiB   traffic 0.805 GB   ->  258 ms
+    8 x v5litepod-8    shard   1 GiB   traffic 1.879 GB   ->  601 ms
+
+  v4, 32 chips, 6.25 GB/s   (the hardware already running)
+    2 x v4-32    shard 512 MiB   traffic 0.537 GB   ->   86 ms
+    4 x v4-16    shard   1 GiB   traffic 1.610 GB   ->  258 ms
+    8 x v4-8     shard   2 GiB   traffic 3.760 GB   ->  601 ms
+
+Full span: 21 ms to 601 ms of DCN time. Nearly 30x dynamic range.
+
+NOTICE THE COINCIDENCE: v4-32chips and v5e-64chips land on IDENTICAL DCN times
+(86 / 258 / 601 ms) by different routes - half the bandwidth cancelled against
+twice the chips. That is a free control pair. Same predicted DCN time, entirely
+different silicon, different generation, different zone. If the throughput
+penalty matches across those pairs, the model is validated on hardware that
+shares nothing but the arithmetic.
+
+
+-------------------------------------------------------------------------------
+4. THE ACTUAL CLAIM BEING TESTED
+-------------------------------------------------------------------------------
+
+Hypothesis: the throughput penalty depends only on the RATIO of DCN time to
+compute time - not on bandwidth, not on byte count, not on chip generation,
+each taken alone.
+
+If true, all nine points collapse onto a single curve when plotted as
+
+    x = (DCN time) / (compute time per step)
+    y = MFU, or step time relative to the no-DCN control
+
+and the curve has a knee whose location is the answer to "how small can a
+tightly-coupled block get before the slow network starts costing you."
+
+This is a much stronger structure than one sweep. Two variables moved
+independently, and the claim is that the result depends only on their ratio. If
+the points collapse, the constant transfers to hardware never touched -
+including block sizes and bandwidths that cannot be provisioned.
+
+If they do NOT collapse, the residual is the finding. Most likely explanation
+is overlap differing by generation: v6e has far more compute per chip, so it
+has more work available to hide the transfer behind. That would itself be a
+real and useful result about how overlap capacity scales with compute density.
+
+Peak bf16 per chip, roughly, for computing the x axis (VERIFY these before
+using them in a writeup):
+  v5e   about 197 TFLOP/s
+  v4    about 275 TFLOP/s
+  v6e   about 918 TFLOP/s
+
+Compute per step per chip = 6 x params x tokens_per_chip, divided by achieved
+FLOP/s. Hold tokens-per-chip CONSTANT across every arm or the x axis is
+meaningless.
+
+
+-------------------------------------------------------------------------------
+5. PROVISIONING
+-------------------------------------------------------------------------------
+
+Primary: v6e in europe-west4-a. Most chips, fastest DCN, and the zone also has
+v5e so the bandwidth comparison needs no zone change.
+
+  2 slices of 32
+    gcloud compute tpus queued-resources create seqax-v6e-2x32 \
+      --project=tpu-research-2026 --zone=europe-west4-a \
+      --node-count=2 --node-prefix=seqax-v6e \
+      --accelerator-type=v6e-32 \
+      --runtime-version=RUNTIME --spot
+
+  4 slices of 16    --node-count=4  --accelerator-type=v6e-16
+  8 slices of 8     --node-count=8  --accelerator-type=v6e-8
+
+  1 slice of 64 (the no-DCN control)
+    --node-id=seqax-v6e-ctl --accelerator-type=v6e-64
+    (use --node-id, not --node-count, for a single slice)
+
+Then the same shapes with v5litepod-32 / -16 / -8 in the same zone.
+
+Each topology change is a full teardown, re-request, re-install, re-download.
+That is the dominant time cost of this experiment. Two consequences:
+
+  a) Get the code fully general FIRST (DCN_HOP_EXPERIMENT.txt section 3) so
+     every topology change is config-only.
+  b) Put the corpus in GCS. It has already been lost once to a teardown.
+     Restoring from GCS in-region is far faster than re-downloading from
+     source, and it makes each re-provision cheap instead of painful.
+
+
+-------------------------------------------------------------------------------
+6. THE RULE BEING DEMONSTRATED
+-------------------------------------------------------------------------------
+
+The hierarchy of the parallelism must match the hierarchy of the network.
+
+  WEIGHT traffic goes on the fast link. It happens every layer, many times per
+  step, and it is large.
+
+  GRADIENT traffic goes on the slow link. Once per step, at the end, and after
+  in-slice sharding it is small.
+
+On the v4 2-slice config that is an 8x difference between the right and wrong
+assignment of the SAME computation to the SAME hardware. Include the wrong
+arrangement as an arm - briefly - because it is the experimental demonstration
+of the rule, not just an assertion.
+
+Corollary: DCN cost grows superlinearly as slices shrink. Each chip's shard
+grows AND the ring lengthens, simultaneously. That is what puts a floor under
+useful block size, and that floor is a hardware design input.
+
+
+-------------------------------------------------------------------------------
+7. OPERATIONAL - SPOT CHANGES THINGS
+-------------------------------------------------------------------------------
+
+Everything except the v4 on-demand is SPOT. Preemption will kill runs, possibly
+mid-sweep, possibly repeatedly.
+
+  - Short checkpoint intervals. Long enough that GCS writes do not dominate,
+    short enough that a preemption costs little.
+  - A restart loop that detects preemption and resumes from the last
+    checkpoint. Check queued-resource state when things go quiet; a preempted
+    slice looks like a hang from the client side.
+  - Measure step time from a window of steps in steady state, not from a whole
+    run. A preemption mid-run should cost one data point, not the sweep.
+  - Prefer running one topology to completion over interleaving. Fewer
+    provisioning cycles, less exposure.
+
+HBM: v5e has 16 GB per chip, not 32 like v4 and v6e. Model state is fine (24
+GiB global over 64 chips is 384 MiB per chip) but activations are tighter.
+Verify the fit on v5e before committing to the full sweep there.
+
+Plus everything in MULTISLICE_PLAN.txt risks: the TPU lock (orphan processes
+holding chips), transient SSH 255 from concurrent --worker=all calls, and one
+worker failing to start making the other seven look hung.
+
+
+-------------------------------------------------------------------------------
+8. ORDER OF WORK
+-------------------------------------------------------------------------------
+
+ 1. probe v6e access in europe-west4-a with the small 2 x v6e-8 request
+ 2. confirm the correct runtime-version string for v6e and v5e
+ 3. MEANWHILE, on the v4 already running: build the code from
+    DCN_HOP_EXPERIMENT.txt section 3 - generalized ici/dcn mesh, typed
+    all_reduce, DCN visibility report
+ 4. verify a single-slice config reproduces today's behavior exactly
+ 5. upload the corpus to GCS
+ 6. run the three v4 arms as a pilot - the code and method get debugged on
+    hardware already in hand, and v4 supplies three of the nine matrix points
+ 7. tear down v4, provision v6e-64 as 1 slice (control), measure
+ 8. reprovision v6e as 2 x 32, 4 x 16, 8 x 8, measure each
+ 9. same shapes on v5litepod in the same zone
+10. plot the collapse: penalty vs (DCN time / compute time)
+11. check the v4-32 vs v5e-64 control pairs land on top of each other
+12. write it up: capability built, prediction, measurement, rule, limits
+
+
+-------------------------------------------------------------------------------
+9. HOW TO PRESENT IT
+-------------------------------------------------------------------------------
+
+Lead with the capability, not the measurement. A measurement alone reads as a
+lab report; capability plus validation reads as engineering.
+
+  "seqax could not express a network hierarchy at all - the mesh was two
+   hardcoded integers built with a constructor that assumes one uniform
+   network, so it could not run multislice. I added hierarchical mesh support,
+   a typed all-reduce, and trace-time reporting of which collectives cross the
+   slow link. Then I used it to measure what that link costs, across a 4x range
+   of interconnect bandwidth and a 30x range of traffic volume."
+
+State the limits up front, they will be found anyway:
+
+  - slices are far smaller than production; the shape and the formula transfer,
+    the absolute numbers do not
+  - small slices mean less compute to hide transfers behind, so the penalty is
+    OVERSTATED relative to production - report exposed non-overlapped time
+    separately from raw bytes
+  - 2 slices is one hop; 4 and 8 give real multi-level hierarchy but still far
+    less structure than a production pod's network tiers
+  - below about 8 chips per slice there is little internal topology left
+
+And the honest risk to control for: seqax builds a large f32 attention-logit
+tensor per layer plus another in the loss head. If step time is compute-bound
+on those, the DCN signal is buried. The no-DCN control arm is what makes every
+other arm interpretable - it is not a formality.

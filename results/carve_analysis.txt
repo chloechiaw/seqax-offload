@@ -1,0 +1,23 @@
+v4, 32 chips, 2B model. Carved as 4 slices of 8 chips (n=4).
+'local' = one slice alone (8 chips, no DCN). copied/split use all 32 chips.
+
+ tok/chip   local  copied   split |  copied exp  split exp | split saves
+     4096    438m   2000m   1688m |       1562m      1250m |        312m
+     8192    812m   2312m   1875m |       1500m      1062m |        438m
+
+
+SUPERLINEARITY: how DCN cost grows with slice count, v4, same total chips
+
+ slices  chips/slice     shard  ring factor  predicted  MEASURED
+      2           16   512 MiB   2(1/2)=1.0       597m      500m
+      4            8     1 GiB   2(3/4)=1.5      1790m     1500m
+
+  going 2 -> 4 slices: shard DOUBLES (512 MiB -> 1 GiB) and the ring factor grows 1.0 -> 1.5
+  predicted growth = 2 x 1.5 = 3.00x
+  measured growth  = 1500 / 500 = 3.00x
+
+THROUGHPUT, 8192 tokens/chip
+
+  8 chips, 1 slice        80,660 tok/s   1.00x vs 8 chips
+  32 chips, copied       113,360 tok/s   1.41x vs 8 chips
+  32 chips, split        139,810 tok/s   1.73x vs 8 chips

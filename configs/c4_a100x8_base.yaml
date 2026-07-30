@@ -38,6 +38,9 @@ num_hosts: 1
 mesh:
   d: 8
   t: 1
+  # Axes carried by the datacenter network between slices, as "name:size".
+  # null means a single slice. See MeshConfig in train.py.
+  dcn: null
 
 io:
   max_io_threads: 1024

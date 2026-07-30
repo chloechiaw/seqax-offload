@@ -22,7 +22,9 @@ def all_gather(spec: str, x):
             raise ValueError(f"Cannot all-gather {before_dim} into {after_dim}")
         if len(before_dim.sharding) == after_n:
             continue
-        x = lax.all_gather(x, tuple(before_dim.sharding[after_n:]), axis=i, tiled=True)
+        gathered_over = tuple(before_dim.sharding[after_n:])
+        shardtypes.record_collective("all_gather", gathered_over, x)
+        x = lax.all_gather(x, gathered_over, axis=i, tiled=True)
     shardtypes.check(x.dtype, after, x)
     return x
 
@@ -44,9 +46,72 @@ def psum_scatter(spec: str, x):
             raise ValueError(f"Cannot reduce-scatter {before_dim} into {after_dim}")
         if len(after_dim.sharding) == before_n:
             continue
-        x = lax.psum_scatter(x, tuple(after_dim.sharding[before_n:]), scatter_dimension=i, tiled=True)
+        scattered_over = tuple(after_dim.sharding[before_n:])
+        shardtypes.record_collective("psum_scatter", scattered_over, x)
+        x = lax.psum_scatter(x, scattered_over, scatter_dimension=i, tiled=True)
     shardtypes.check(x.dtype, after, x)
     return x
+
+
+def all_reduce(spec: str, x, *, over):
+    """String-specified all-reduce: sum `x` over the named mesh axes, leaving sharding unchanged.
+
+    For example:
+      all_reduce('M/d', grads, over='data')
+
+    Note the deliberately different API. `all_gather` and `psum_scatter` both CHANGE the
+    sharding, so the arrow carries real information -- the difference between the two sides
+    *is* the operation. An all-reduce changes nothing about the sharding, so the arrow form
+
+      all_reduce('M/d -> M/d', x)
+
+    would say nothing at all. Rather than write a spec whose two halves are always identical,
+    the axes reduced over are named separately, in `over`. A different kind of operation gets
+    a different shape of API.
+
+    This is the operation that synchronizes gradients across data-parallel replicas. When
+    those replicas are separate slices, `over` names a DCN axis, and this is typically the
+    only collective in a training step that should touch the slow network -- see
+    shardtypes.dcn_report().
+    """
+    shape = shardtypes.ShapeSpec.parse(spec)
+    shardtypes.check(x.dtype, shape, x)
+    axes = (over,) if isinstance(over, str) else tuple(over)
+    if not axes:
+        raise ValueError("all_reduce needs at least one axis to reduce over")
+    for axis in axes:
+        for dim in shape.dims:
+            if axis in dim.sharding:
+                raise ValueError(
+                    f"Cannot all_reduce over {axis}: {spec} is already sharded over it. "
+                    f"Reducing over an axis the tensor is split along is a psum_scatter, not an all_reduce."
+                )
+    shardtypes.record_collective("all_reduce", axes, x)
+    x = lax.psum(x, axes)
+    # Sharding is unchanged by construction, but re-checking keeps this op honest in exactly
+    # the way the others are: nothing leaves shardops without having been checked on the way out.
+    shardtypes.check(x.dtype, shape, x)
+    return x
+
+
+def all_reduce_tree(tree, *, over):
+    """all_reduce every leaf of a pytree over the same axes, accounted as one collective.
+
+    The gradient tree is the case this exists for: one logical synchronization spanning
+    hundreds of arrays. Recording it per-leaf would fill the DCN report with hundreds of rows
+    sharing a source line; recording the total as a single entry is both accurate and what
+    you want to read.
+
+    No spec string, because there is no single spec -- each leaf carries its own sharding, and
+    all_reduce leaves every one of them unchanged.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    axes = (over,) if isinstance(over, str) else tuple(over)
+    if not axes:
+        raise ValueError("all_reduce_tree needs at least one axis to reduce over")
+    total_bytes = sum(leaf.size * jnp.dtype(leaf.dtype).itemsize for leaf in leaves)
+    shardtypes.record_collective_bytes("all_reduce", axes, total_bytes)
+    return treedef.unflatten([lax.psum(leaf, axes) for leaf in leaves])
 
 
 def all_to_all(spec: str, x):
@@ -111,6 +176,7 @@ def all_to_all(spec: str, x):
 
     # `split_axis` is the axis we cut into per-destination-chip pieces (the one gaining the
     # sharding); `concat_axis` is the axis we glue the received pieces onto (the one losing it).
+    shardtypes.record_collective("all_to_all", moved, x)
     x = lax.all_to_all(x, moved, split_axis=dst, concat_axis=src, tiled=True)
     shardtypes.check(x.dtype, after, x)
     return x

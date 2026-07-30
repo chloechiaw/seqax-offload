@@ -1,0 +1,421 @@
+MULTISLICE INTERCONNECT EXPERIMENT - PLAN
+seqax on 2 x v4-32, us-central2-b, project tpu-research-2026
+written 2026-07-28
+
+
+-------------------------------------------------------------------------------
+0. WHAT WE HAVE RIGHT NOW
+-------------------------------------------------------------------------------
+
+Queued resource: seqax-ms-qr, state ACTIVE, node-count 2
+Slices:          seqax-ms-0 and seqax-ms-1
+                 each v4-32, topology 2x2x4, 16 chips, 4 workers (hosts)
+                 4 chips per worker
+Total:           8 workers, 32 chips
+Runtime:         tpu-ubuntu2204-base
+Zone:            us-central2-b
+
+The old v4-64 (seqax-v4-32 / seqax-v4-32-qr) is deleted. Everything unique on
+it was pushed to github before deletion, on branch tpu-wip of
+github.com/chloechiaw/seqax-offload, commits 3b59a90 and 1705ee1. That includes
+the nanochat loader changes, the slicemon hook, train.py changes, the
+nanochat_v4x32_2b config, the trained tokenizer, and the tpu-only scripts
+(corpus_stats.py, fetch_shards.py, tok_train_tpu.py, preflight.py,
+host_agent.py) under tpu/.
+
+NOT saved: the 18 GB corpus in ~/climbmix. It has to be re-downloaded with
+tpu/fetch_shards.py. Consider putting it in GCS this time so the next teardown
+is cheap.
+
+
+-------------------------------------------------------------------------------
+1. WHY TWO SLICES INSTEAD OF ONE
+-------------------------------------------------------------------------------
+
+Inside one slice, chips talk over ICI, the fast on-rack optical interconnect.
+Between slices, data has to leave the chip, go through the host CPU and its
+network cards, cross the regular datacenter network (DCN), and come back in on
+the other side. DCN is roughly 6.25 GB/s per chip on v4-era hardware. ICI is an
+order of magnitude or more faster.
+
+So splitting 32 chips into 2 x 16 gives us a real slow link in the middle that
+we control. That is the whole point. On a single v4-64 there is no slow link to
+study.
+
+This is what a scale-out interconnect actually is: the network you use when the
+job outgrows one tightly-coupled block. The question the experiment answers is
+"how slow can the scale-out link be before training falls apart, and what
+partitioning survives on it." That is a system design question, not a tuning
+question, which is why it is worth doing carefully.
+
+
+-------------------------------------------------------------------------------
+2. MINIMAL THINGS THAT MUST WORK BEFORE ANY EXPERIMENT
+-------------------------------------------------------------------------------
+
+Do these in order. Do not skip ahead to the experiment; each step here can
+fail and each failure looks like a different problem later.
+
+2.1  jax[tpu] installed on all 8 workers
+
+     Both slices, all workers. Note it must be jax[tpu], not jax[cpu].
+     requirements-cpu.txt pins jax[cpu] which will not see the chips.
+
+     for S in seqax-ms-0 seqax-ms-1; do
+       gcloud compute tpus tpu-vm ssh $S --zone=us-central2-b --worker=all \
+         --command="pip install -q 'jax[tpu]==0.4.35' \
+           -f https://storage.googleapis.com/jax-releases/libtpu_releases.html"
+     done
+
+     Staying on 0.4.35 on purpose: it matches the old machine, so if something
+     breaks we know it is the two-slice change and not a JAX upgrade. Bumping
+     JAX is a separate task for later.
+
+2.2  Confirm each slice sees its own 16 chips
+
+     gcloud compute tpus tpu-vm ssh seqax-ms-0 --zone=us-central2-b --worker=0 \
+       --command="python3 -c 'import jax; print(jax.local_device_count())'"
+
+     Expect 4 (that worker's chips). A single-worker import will not show 32
+     and that is not a failure. Do not read anything into it.
+
+2.3  THE ACTUAL TEST: launch on all 8 workers at once and count devices
+
+     This is the only test that means anything. Write a tiny script, put it on
+     every worker, launch it simultaneously on all 8, and see what they report.
+
+     Script (probe.py):
+       import jax
+       jax.distributed.initialize()
+       print("process", jax.process_index(), "of", jax.process_count(),
+             "global devices", jax.device_count(),
+             "local", jax.local_device_count(), flush=True)
+
+     Launch:
+       for S in seqax-ms-0 seqax-ms-1; do
+         gcloud compute tpus tpu-vm ssh $S --zone=us-central2-b --worker=all \
+           --command="python3 ~/probe.py" &
+       done
+       wait
+
+     WANT: global devices 32, process_count 8.
+     IF IT SAYS 16 and process_count 4, the two slices are running as two
+     independent jobs and nothing downstream is valid.
+
+     RESULT 2026-07-28: PASSED. All 8 processes reported
+       process N of 8, global 32, local 4
+     jax.distributed.initialize() with NO ARGUMENTS was sufficient. No
+     MEGASCALE env vars had to be set by hand; JAX auto-detected the two-slice
+     topology from the queued resource. Multislice is confirmed working.
+
+     STILL OPEN: the probe called initialize() explicitly. seqax does not, in
+     the non-ClearML path. See 2.4.
+
+2.4  Likely fix if 2.3 gives 16
+
+     Look at train.py around line 530-547. jax.distributed.initialize is only
+     called inside the ClearML branch:
+
+       if config.training.queue:
+           ...
+           jax.distributed.initialize(...)
+       else:
+           logger = None        <-- no initialize call at all
+
+     On one slice this is fine because JAX auto-detects TPU peers. Whether that
+     auto-detection spans two slices is the open question. If it does not, add
+     an explicit jax.distributed.initialize() to the else branch.
+
+     If that still is not enough, the multislice coordination env vars
+     (MEGASCALE_COORDINATOR_ADDRESS, MEGASCALE_NUM_SLICES, MEGASCALE_SLICE_ID,
+     MEGASCALE_PORT) may need to be set per worker at launch. Check whether the
+     QR set them automatically first:
+
+       gcloud compute tpus tpu-vm ssh seqax-ms-0 --zone=us-central2-b \
+         --worker=0 --command="env | grep -i megascale"
+
+2.5  Code and data on both slices
+
+     - git clone the repo on all 8 workers, checkout tpu-wip
+     - restore tokenizer from tpu/tokenizer.pkl into ~/.cache/nanochat/tokenizer
+     - re-download the corpus with tpu/fetch_shards.py (18 GB per worker), or
+       better, upload it to GCS once and pull from there
+     - install the rest of the python deps (hydra, zarr<3, transformers, etc)
+
+2.6  Generalize experiment/launch.sh
+
+     It is currently hardcoded to a single slice named v4-od. It needs to loop
+     over both slice names. slicemon also needs to know which slice each host
+     belongs to, otherwise the chip display will be wrong or ambiguous.
+
+2.7  Smoke run
+
+     Small config, few steps, both slices, confirm loss descends and nothing
+     hangs. Do not go straight to the real run.
+
+
+-------------------------------------------------------------------------------
+3. THE FEATURE: MAKE THE MESH EXPRESS THE NETWORK HIERARCHY
+-------------------------------------------------------------------------------
+
+This is the actual contribution to seqax, and it is required for the
+experiment. Right now seqax cannot express a two-slice topology at all.
+
+3.1  What is wrong today
+
+     train.py line 448:
+       Mesh(mesh_utils.create_device_mesh([config.mesh.d, config.mesh.t],
+            jax.devices()), ("d", "t"))
+
+     create_device_mesh assumes one slice with one uniform network. There is no
+     way to say "this axis is inside a slice, that axis crosses slices."
+
+     train.py line 409:
+       class MeshConfig:
+           d: int
+           t: int
+
+     Two integers. Exactly two axes, hardcoded names.
+
+3.2  What JAX already provides
+
+     mesh_utils.create_hybrid_device_mesh(mesh_shape, dcn_mesh_shape, devices)
+
+     Two shapes: one for inside a slice (ICI), one for across slices (DCN).
+     Verified this exists even in the pinned 0.4.35, so no JAX upgrade needed.
+
+3.3  What shardlib already supports (checked, do not re-derive)
+
+     - shardtypes.py DimSpec.parse splits on "/" and keeps everything after the
+       first piece, so f32["d_model/a/b/c"] already parses. Any number of mesh
+       axes per tensor axis.
+     - shardops.py all_gather requires the output sharding to be a PREFIX of
+       the input sharding and gathers only the difference. So
+       all_gather("M/dp/fsdp -> M/dp", w) is a PARTIAL gather over fsdp only,
+       leaving dp in place. psum_scatter is the mirror image.
+     - train.py line 159 already does all_gather("M/t/d -> M"), two mesh axes
+       on one tensor axis.
+
+     Conclusion: hierarchical sharding is already implemented in the library.
+     The only blocker is that MeshConfig is two ints and the mesh is built with
+     the wrong constructor. This is a small change, not a rewrite.
+
+3.4  The change
+
+     a) Generalize MeshConfig from two ints to named axes with an ici/dcn split
+     b) Build the mesh with create_hybrid_device_mesh
+     c) Update the hardcoded ("d", "t") in the loss psum at train.py line 326
+     d) Make sure a single-slice config collapses to exactly today's behavior,
+        so the change is safe to propose upstream
+
+     Config shape, something like:
+
+       mesh:
+         dcn: {data: 2}          # across slices, slow
+         ici: {fsdp: 16, t: 1}   # within a slice, fast
+
+3.5  There is no typed all_reduce in shardlib
+
+     all_gather and psum_scatter both change the sharding, so the arrow carries
+     information. An all_reduce does not change the sharding, so the arrow
+     convention breaks. Today the code calls jax.lax.psum raw (train.py 326,
+     shardops.py 184), bypassing all the type checking every other op gets.
+
+     Cross-slice gradient sync is an all_reduce. Something like
+
+       all_reduce("M/fsdp", x, over="data")
+
+     would be an opinionated addition: different API shape for a genuinely
+     different kind of operation. Worth doing, worth arguing about.
+
+
+-------------------------------------------------------------------------------
+4. THE EXPERIMENT
+-------------------------------------------------------------------------------
+
+Model: the existing 2B config. 2^31 params exactly. 8 layers, d_model 4096,
+d_ff 16384, vocab 32768, batch 256, len 2048.
+
+Weights in bf16 are 4.00 GiB. Gradients in f32 are 8 GiB global.
+
+4.1  Predictions to compute BEFORE running anything
+
+     Do the arithmetic first so you have something to check the measurements
+     against. This is a deliverable on its own.
+
+     ARM A - correct hierarchy. Shard weights over the 16 chips within a slice
+     (ICI), replicate across the 2 slices, so only the gradient sum crosses
+     DCN.
+
+       gradient per chip: 8 GiB / 16 = 512 MiB
+       over DCN at 6.25 GB/s: 0.537 GB / 6.25 = about 86 ms
+       against a ~1 s step: about 9 percent
+       -> small enough that the compiler has a real chance to hide it,
+          big enough to measure whether it does
+
+     ARM B - wrong hierarchy. Let FSDP span all 32 chips, so weight gathering
+     crosses DCN.
+
+       weight traffic per chip per forward: 31/32 x 4 GiB = 3.875 GiB = 4.16 GB
+       over DCN: 4.16 / 6.25 = about 666 ms
+       against a ~1 s step: about 67 percent
+       -> the run falls over
+
+     The roughly 8x gap between A and B is the headline result. The rule it
+     demonstrates is: the hierarchy of your parallelism has to match the
+     hierarchy of your network. That is the thing worth writing down.
+
+     ARM C - single-slice baseline. Run on seqax-ms-0 alone, 16 chips, no DCN
+     at all. This is the control. Halve the batch to keep tokens-per-chip
+     constant, otherwise you are changing two things at once.
+
+4.2  What to measure
+
+     - step time
+     - MFU (already reported by seqax)
+     - peak HBM per chip
+     - from the profile: how much time is spent in the cross-slice collective,
+       and how much of it overlaps with compute
+
+     The overlap number is the interesting one. Bytes tell you the volume;
+     only the profile tells you whether it was hidden. A big byte count that is
+     fully hidden costs nothing.
+
+4.3  The sweep
+
+     Once A vs B is established, vary how much crosses DCN and find where it
+     breaks. Options:
+       - change what is sharded on which axis
+       - change batch size (activation traffic scales with it, weight traffic
+         does not)
+       - change sequence length (same reason)
+
+     Output: a curve of step time vs bytes-crossing-DCN. That generalizes past
+     the specific config, which is what makes it a result rather than a number.
+
+4.4  Honest limitation
+
+     Two slices is one DCN hop. Real pod-scale training has more structure than
+     that. The experiment measures the shape of the effect, not the absolute
+     numbers you would see at 1000 chips.
+
+
+-------------------------------------------------------------------------------
+5. RISKS AND THINGS THAT WILL PROBABLY GO WRONG
+-------------------------------------------------------------------------------
+
+- device_count comes back 16, not 32. Most likely first failure. See 2.4.
+
+- The MEGASCALE env vars are not set and have to be plumbed through the launch
+  path manually.
+
+- One worker fails to start and the other seven hang waiting. This looks like a
+  hang, not an error. Always check all 8 workers when something is stuck.
+
+- THE TPU LOCK. Only one process per worker can hold the chips. Any leftover
+  process makes the next run fail with
+
+    ABORTED: The TPU is already in use by process with pid NNNN
+
+  This looks like a hardware or install problem and it is neither. It happens
+  constantly, because killing a local gcloud ssh does NOT kill the remote
+  python it started - the orphan keeps holding the TPU.
+
+  Two habits that prevent it:
+
+  1) Wrap every remote TPU command in a timeout so it cannot orphan:
+       timeout 120 python3 -c "import jax; ..."
+
+  2) Clear the TPU at the top of launch.sh, before every run:
+       sudo pkill -9 -f libtpu 2>/dev/null
+       sudo pkill -9 -f 'local_device_coun[t]' 2>/dev/null
+       sleep 2
+
+  To find and clear orphans by hand (the [t] trick stops the pattern from
+  matching the killing command itself):
+
+    gcloud compute tpus tpu-vm ssh SLICE --zone=us-central2-b --worker=all \
+      --command="ps -eo pid,cmd | grep 'impor[t] jax' | grep -v grep"
+
+    gcloud compute tpus tpu-vm ssh SLICE --zone=us-central2-b --worker=all \
+      --command="sudo pkill -9 -f 'impor[t] jax'; sleep 2; echo cleared"
+
+- Transient SSH failures with return code 255 and a message about ssh-agent and
+  ~/.ssh/google_compute_engine. Usually NOT a key problem - it is concurrent
+  gcloud ssh --worker=all calls colliding over key propagation. Retrying works.
+  Avoid running two --worker=all commands against the same slice at once.
+
+- create_hybrid_device_mesh does not map onto the physical topology the way you
+  expect. Check the actual device ordering, do not assume.
+
+- The corpus re-download (18 GB x 8 workers) takes a while and can fail
+  partway. Put it in GCS after the first successful download.
+
+- Preemption. These are queued resources; check state if things go quiet.
+
+- The measurement is dominated by something unrelated (naive attention builds
+  a 2 GiB f32 logits tensor per layer; the loss head builds another 2 GiB
+  tensor). If step time is dominated by those, the DCN effect will be hard to
+  see. Worth knowing your compute-bound baseline before attributing anything
+  to the network.
+
+
+-------------------------------------------------------------------------------
+6. ORDER OF WORK
+-------------------------------------------------------------------------------
+
+1. finish jax[tpu] install on all 8 workers
+2. run the 8-worker probe, confirm 32 devices, fix train.py if not
+3. restore code, tokenizer, corpus on both slices
+4. generalize launch.sh for two slices
+5. smoke run, confirm loss descends
+6. do the arithmetic in 4.1 on paper
+7. build the hybrid mesh change (3.4)
+8. run arm C (single slice baseline)
+9. run arm A (correct hierarchy)
+10. run arm B (wrong hierarchy) - expect it to be bad, that is the point
+11. profile arm A, find the overlap fraction
+12. sweep, build the curve
+13. write it up: prediction, measurement, rule
+
+
+-------------------------------------------------------------------------------
+7. USEFUL COMMANDS
+-------------------------------------------------------------------------------
+
+state of the queued resource
+  gcloud compute tpus queued-resources describe seqax-ms-qr \
+    --zone=us-central2-b --format="value(state.state)"
+
+list the slices
+  gcloud compute tpus tpu-vm list --zone=us-central2-b
+
+ssh one worker
+  gcloud compute tpus tpu-vm ssh seqax-ms-0 --zone=us-central2-b --worker=2
+
+run on every worker of both slices
+  for S in seqax-ms-0 seqax-ms-1; do
+    gcloud compute tpus tpu-vm ssh $S --zone=us-central2-b --worker=all \
+      --command="..."
+  done
+
+launch a training run on all 8 workers, backgrounded
+  for S in seqax-ms-0 seqax-ms-1; do
+    gcloud compute tpus tpu-vm ssh $S --zone=us-central2-b --worker=all \
+      --command="cd ~/seqax-offload && nohup python -m train \
+        --config-name=... > /tmp/run.log 2>&1 &" &
+  done
+  wait
+
+tail one worker
+  gcloud compute tpus tpu-vm ssh seqax-ms-0 --zone=us-central2-b --worker=0 \
+    --command="tail -f /tmp/run.log"
+
+check megascale env
+  gcloud compute tpus tpu-vm ssh seqax-ms-0 --zone=us-central2-b --worker=0 \
+    --command="env | grep -i megascale"
+
+tear down when done
+  gcloud compute tpus queued-resources delete seqax-ms-qr \
+    --zone=us-central2-b --force
+  (save anything unique FIRST - see section 0)
