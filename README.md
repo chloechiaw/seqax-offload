@@ -34,3 +34,21 @@
   - 0.93x the throughput
 - wow v6es are hard to get
 
+## 7/30/2026
+- ran the two slice job. report printed 1024 MiB and predicted 86 ms. step took 1599 ms.
+- wrote a microbenchmark to check the wire directly, got 0.90 GB/s per chip. ran it again on v4. also 0.90. spec says 6.25 and 12.5 so this is super low....
+- the batch sweep, 4 points, one slice vs two at matched tokens per chip.
+  by up to 41% on the comm bound runs. 
+- 540m, 1b, 2b at fixed tokens per chip to see if model size moves anything
+- seq len 2048 at the same tokens per chip
+- measured ici with the same probe: 22.2 GB/s.
+
+## 7/31/2026
+
+- spent a few hours trying to get more v6e helppp
+- found the ip address quota is 8 per region, which caps how many slices you can carve
+  regardless of chips
+- moved everything to v4 on demand. provisions in 7 minutes every time. should have switched
+  much earlier
+- wrote a 5B config to check the law is not a small model artifact. since repo is llama 2 shape,  just made that bigger. 
+
