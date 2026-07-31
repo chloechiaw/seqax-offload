@@ -1,0 +1,51 @@
+# 5.13B, Llama-2 shape. python -m train --config-name=c4_5b
+#
+# Sized deliberately: 4 chips per slice is the binding constraint, because model state is
+# sharded WITHIN a slice and replicated across slices. Resident state plus transient
+# gradients are 16 bytes per parameter (f32 weights + adam mu + adam nu + grads), so
+# per-chip footprint is 16 x params / chips_per_slice:
+#
+#   layers  params   state@4chips   activations   total    verdict
+#       24   5.13B      19.1 GiB       ~12.3 GiB  31.4 G   MEASURED OOM, over by 620 MB
+#       20   4.32B      12.1 GiB        15.6 GiB  27.6 G   MEASURED OK
+#
+# against a ~30.75 GiB HBM limit. Both rows are measured, not estimated -- 24 layers was
+# tried first and died by 620 MB. Activations are the term that surprises: 15.6 GiB at
+# 1 sequence per chip, because seqax materialises the full attention logits (below).
+#
+# 20 layers is the largest depth that clears all three carves of the hop-count sweep, which
+# matters more than raw size: the whole point is comparing 2 / 4 / 8 slices at a FIXED model,
+# and a size that OOMs at 8 slices costs exactly the comparison the study is for.
+#
+# Depth was cut rather than width so d_model stays 4096 -- that keeps every collective size
+# and the divisibility over 16 / 8 / 4 chips per slice identical to the 2B sweep.
+#
+# Architecture is unchanged from seqax's default: RMSNorm, RoPE, grouped-query attention,
+# gated FFN. That is already the Llama-2/3 shape, so this is purely a config change.
+defaults:
+- c4_a100x8_base
+- _self_
+
+training:
+  warmup_steps: 2
+  steps: 20
+  steps_for_lr: 20
+  learning_rate: 1.0e-5
+  tokens:
+    batch: 32
+    # 2048 rather than 4096: seqax has no flash attention, it materialises the full
+    # [batch, heads, L, L] f32 logits tensor. At 32 heads that is 537 MB per sequence per
+    # layer at L=2048, and 2.1 GB at L=4096 -- which will not fit alongside the model state.
+    len: 2048
+
+model:
+  d_model: 4096
+  n_q_per_kv: 1
+  n_kv: 32          # 32 x 128 = 4096 = d_model
+  d_head: 128
+  layers: 20
+  d_ff: 11008       # Llama-2 gated FFN width
+  vocab: 32768
+  rope_max_timescale: 10000
+
+checkpoint_interval: 100000

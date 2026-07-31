@@ -1,0 +1,32 @@
+v4, 32 chips total, 2B model, 8192 tokens/chip. Carved into n slices.
+
+HOW THE INTERCONNECT COST GROWS WITH SLICE COUNT
+
+ slices  chips/  gradient   ring    bytes  predicted  MEASURED  meas/pred   growth
+          slice     shard 2(n-1)/n
+      2      16      0.5G   1.00    0.50G       597m      500m      0.838        -
+      4       8      1.0G   1.50    1.50G      1790m     1500m      0.838    3.00x
+      8       4      2.0G   1.75    3.50G      4176m     3688m      0.883    2.46x
+
+  measured/predicted is 0.84, 0.84, 0.88 -- a CONSTANT ~15% under prediction at every point.
+  that gap is the fixed overlap credit. the formula's shape is exactly right.
+
+  growth measured : 3.00x then 2.46x     (predicted 3.00x then 2.33x)
+  the bend is real: 2(n-1)/n flattens toward 2 while the shard keeps doubling.
+
+WEIGHTS COPIED vs WEIGHTS SPLIT, at every slice count
+
+ slices   copied    split  split saves   as %
+      4    2312m    1875m         438m    19%
+      8    4500m    3500m        1000m    22%
+   (v6e at n=2, 8 chips/slice: 1438 vs 1188, saves 250m, 17%)
+
+  split's advantage GROWS with slice count: 250m -> 438m -> 1000m.
+  exactly what ring amortization predicts -- the all-reduce grows with n,
+  the all-gather's boundary-crossing fraction does not.
+
+THROUGHPUT for a fixed 32-chip budget, 8192 tokens/chip
+
+  2 slices (16 chips/slice):    199,729 tok/s
+  4 slices ( 8 chips/slice):    113,360 tok/s
+  8 slices ( 4 chips/slice):     58,254 tok/s

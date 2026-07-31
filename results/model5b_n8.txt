@@ -1,0 +1,14 @@
+4.32B (20 layers, d_model 4096, 32 heads, d_ff 11008), seq len 2048
+v4, 32 chips as 8 slices of 4.  2048 tokens/chip.
+
+  one slice (4 chips), no DCN           625 ms
+  8 slices, weights copied             8250 ms
+  exposed interconnect                 7625 ms
+
+  reported by the new instrumentation: 7203 MiB/chip/step over 'data'
+  predicted at measured 0.90 GB/s:        8392 ms
+  measured / predicted:                  0.909   (2B sweep gave 0.838, 0.838, 0.883)
+
+  r = 12.2
+  throughput retained  0.0758
+  1/(1+r)              0.0758   <- still exact, at 2x the model size
