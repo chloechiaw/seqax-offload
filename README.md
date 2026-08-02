@@ -52,3 +52,7 @@
   much earlier
 - wrote a 5B config to check the law is not a small model artifact. since repo is llama 2 shape,  just made that bigger. 
 
+
+## 8/1/2026 
+- finished running v4 sweeps, v6 is not provisionable 
+- making skme graphs 
