@@ -56,3 +56,6 @@
 ## 8/1/2026 
 - finished running v4 sweeps, v6 is not provisionable 
 - making skme graphs 
+
+## 8/2/2026 
+- v4 and v6 dotn seem tk have thag mang diffedences, sinilar mem
